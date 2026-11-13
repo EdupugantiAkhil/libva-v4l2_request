@@ -105,7 +105,7 @@ A surface's pixels can come from three places:
    exported as a DMA-BUF, exactly as for any surface this driver creates.
    Uploads use `vaPutImage` or `vaDeriveImage`.
 2. **A decode context's CAPTURE buffer**, when an AVD decode wrote the
-   surface (the zero-copy transcode path: `-hwaccel vaapi` followed by
+   surface (the VA-surface transcode path: `-hwaccel vaapi` followed by
    `h264_vaapi`).
 3. **An imported DMA-BUF** (`surface->import`), which can only be encoded.
 
