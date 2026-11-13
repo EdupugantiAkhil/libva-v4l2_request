@@ -2125,6 +2125,86 @@ static void case_lifetime(void)
 	teardown();
 }
 
+/* ---- completion bookkeeping (review findings) -------------------------- */
+
+static void case_completion(void)
+{
+	VAConfigAttrib attributes[1] = { { VAConfigAttribRateControl, VA_RC_CBR } };
+	VACodedBufferSegment *segment = NULL;
+	VASurfaceID surfaces[3];
+	VABufferID coded[3];
+	VAConfigID config;
+	VAContextID context;
+
+	setup(FAKE_AVE_PATH);
+	CHECK(vtable.vaCreateConfig(&driver, VAProfileH264High, VAEntrypointEncSlice,
+				    attributes, 1, &config) == VA_STATUS_SUCCESS);
+	CHECK(vtable.vaCreateContext(&driver, config, 1280, 720, VA_PROGRESSIVE,
+				     NULL, 0, &context) == VA_STATUS_SUCCESS);
+	CHECK(vtable.vaCreateSurfaces2(&driver, VA_RT_FORMAT_YUV420, 1280, 720,
+				       surfaces, 3, NULL, 0) == VA_STATUS_SUCCESS);
+
+	/* Two frames in flight; the second's coded buffer is destroyed unmapped.
+	 * Neither the first nor a third frame may wait on it afterwards. */
+	lazy = true;
+	coded[0] = make_buffer(context, VAEncCodedBufferType, 1 << 20, NULL);
+	coded[1] = make_buffer(context, VAEncCodedBufferType, 1 << 20, NULL);
+	CHECK(submit_h264(context, surfaces[0], coded[0], false, 2, 1, true) ==
+	      VA_STATUS_SUCCESS);
+	CHECK(submit_h264(context, surfaces[1], coded[1], false, 0, 1, false) ==
+	      VA_STATUS_SUCCESS);
+	CHECK(vtable.vaDestroyBuffer(&driver, coded[1]) == VA_STATUS_SUCCESS);
+	CHECK(!V4L2R_SURFACE(drv, surfaces[1])->encode_pending);
+	CHECK(vtable.vaMapBuffer(&driver, coded[0], (void **)&segment) ==
+	      VA_STATUS_SUCCESS);
+	CHECK(segment && segment->size == 7);
+	CHECK(vtable.vaUnmapBuffer(&driver, coded[0]) == VA_STATUS_SUCCESS);
+	coded[2] = make_buffer(context, VAEncCodedBufferType, 1 << 20, NULL);
+	CHECK(submit_h264(context, surfaces[2], coded[2], false, 0, 1, false) ==
+	      VA_STATUS_SUCCESS);
+	segment = NULL;
+	CHECK(vtable.vaMapBuffer(&driver, coded[2], (void **)&segment) ==
+	      VA_STATUS_SUCCESS);
+	CHECK(segment && segment->size == 7 && segment->status == 0);
+	CHECK(vtable.vaUnmapBuffer(&driver, coded[2]) == VA_STATUS_SUCCESS);
+
+	/* Reusing a ready coded buffer for another input releases the old one. */
+	CHECK(submit_h264(context, surfaces[1], coded[0], false, 0, 1, false) ==
+	      VA_STATUS_SUCCESS);
+	CHECK(!V4L2R_SURFACE(drv, surfaces[0])->encode_pending);
+	CHECK(vtable.vaSyncSurface(&driver, surfaces[1]) == VA_STATUS_SUCCESS);
+	lazy = false;
+
+	/* A coded buffer too small for the frame still completes, flagged. */
+	CHECK(vtable.vaDestroyBuffer(&driver, coded[2]) == VA_STATUS_SUCCESS);
+	coded[2] = make_buffer(context, VAEncCodedBufferType, 4, NULL);
+	CHECK(submit_h264(context, surfaces[2], coded[2], false, 0, 1, false) ==
+	      VA_STATUS_SUCCESS);
+	CHECK(vtable.vaSyncSurface(&driver, surfaces[2]) == VA_STATUS_SUCCESS);
+	segment = NULL;
+	CHECK(vtable.vaMapBuffer(&driver, coded[2], (void **)&segment) ==
+	      VA_STATUS_SUCCESS);
+	CHECK(segment && segment->size == 0 &&
+	      (segment->status & VA_CODED_BUF_STATUS_FRAME_SIZE_OVERFLOW));
+	CHECK(vtable.vaUnmapBuffer(&driver, coded[2]) == VA_STATUS_SUCCESS);
+	/* The CAPTURE buffer came back: the session keeps encoding. */
+	segment = NULL;
+	CHECK(submit_h264(context, surfaces[0], coded[0], false, 0, 1, false) ==
+	      VA_STATUS_SUCCESS);
+	CHECK(vtable.vaMapBuffer(&driver, coded[0], (void **)&segment) ==
+	      VA_STATUS_SUCCESS);
+	CHECK(segment && segment->size == 7 && segment->status == 0);
+	CHECK(vtable.vaUnmapBuffer(&driver, coded[0]) == VA_STATUS_SUCCESS);
+	CHECK(ave.bitrate == 2000000);
+
+	CHECK(vtable.vaDestroyBuffer(&driver, coded[0]) == VA_STATUS_SUCCESS);
+	CHECK(vtable.vaDestroyBuffer(&driver, coded[2]) == VA_STATUS_SUCCESS);
+	CHECK(vtable.vaDestroyContext(&driver, context) == VA_STATUS_SUCCESS);
+	CHECK(vtable.vaDestroySurfaces(&driver, surfaces, 3) == VA_STATUS_SUCCESS);
+	CHECK(vtable.vaDestroyConfig(&driver, config) == VA_STATUS_SUCCESS);
+	teardown();
+}
+
 int main(int argc, char **argv)
 {
 	const char *name = argc > 1 ? argv[1] : "";
@@ -2143,6 +2223,8 @@ int main(int argc, char **argv)
 		case_import();
 	else if (!strcmp(name, "lifetime"))
 		case_lifetime();
+	else if (!strcmp(name, "completion"))
+		case_completion();
 	else {
 		fprintf(stderr, "unknown case '%s'\n", name);
 		return 2;

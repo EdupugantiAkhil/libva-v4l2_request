@@ -43,7 +43,7 @@ driver keeps its own decode path.
   * imported linear NV12/P010 DMA-BUFs, both legacy `DRM_PRIME` (Chrome's
     path) and `DRM_PRIME_2`.
 
-Rate parameters that AVE cannot apply are refused, not ignored. Each VA field
+Rate parameters that AVE cannot apply at all are refused, not ignored. Each VA field
 is listed in `src/ave_params.c` as either mapped to an `apple-ave` control or
 documented as having no effect. The same applies to:
 
@@ -54,6 +54,12 @@ documented as having no effect. The same applies to:
 * temporal layers;
 * ROI;
 * maximum frame size.
+
+After the first picture, AVE accepts only a new average bit rate. Later
+changes to frame rate, peak bit rate, rate-control mode or QP limits keep the
+values from the first picture and are reported once in the diagnostics log
+(`encode-rate`). Refusing them would end WebRTC-style sessions that adapt
+these values continuously.
 
 `vaRenderPicture` stores the request. The error is returned from
 `vaEndPicture`, which is where FFmpeg and Chrome check for it.
@@ -120,11 +126,20 @@ using AVE's layout: its own stride, with chroma right after `height` luma
 rows. AVE cannot import DMA-BUFs into its OUTPUT queue, so this costs one
 CPU copy per frame, as it did in `ave_drv_video.so`.
 
-Encode never binds the surface or holds it after the copy. Before the next
-use, `vaSyncSurface` on a pending input completes the encode, as do reusing
-the input, destroying it and destroying the context. A surface can therefore
-be decoded into, encoded and read back by `vaGetImage` in any order. The
-host test `ave-encode-lifetime` covers this.
+Encode never binds the surface or holds it after the copy.
+`surface->encode_pending` only tracks whether the coded frame is done:
+
+* `vaSyncSurface` on the input waits for the coded frame, and then for any
+  decode queued into the same surface since.
+* Reusing the input as another encode input, or destroying it, also waits
+  for the coded frame.
+* Destroying the encode context cancels the frames still in flight. Their
+  coded buffers can then only be destroyed, not mapped, and every coded
+  buffer of that context loses its frame; map coded buffers before
+  destroying their context, as FFmpeg and Chrome do.
+
+A surface can therefore be decoded into, encoded and read back by
+`vaGetImage` in any order. The host test `ave-encode-lifetime` covers this.
 
 Imported surfaces are refused where the driver would write them or hand out
 their memory:
@@ -141,8 +156,12 @@ with its OUTPUT timestamp, `1 + (seq - 1) * 1e6 / fps` µs.
 
 * `vaSyncSurface`, `vaQuerySurfaceStatus` and `vaSyncBuffer` (VA ≥ 1.9)
   service the queue until the frame they are waiting on is complete.
-* `vaMapBuffer` of a coded buffer waits for that frame and then delivers
-  packets in order.
+* `vaMapBuffer` of a coded buffer waits for that frame, and for any
+  frame of the same context submitted earlier that is still in flight.
+  Destroyed or failed submissions never hold later buffers back.
+* Packets for a frame whose coded buffer is gone are dropped and their
+  CAPTURE buffers recycled. A frame larger than its coded buffer completes
+  with `VA_CODED_BUF_STATUS_FRAME_SIZE_OVERFLOW` and the bytes that fit.
 * A forced IDR waits for the OUTPUT queue to go idle and then sets
   `V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME`.
 
@@ -163,7 +182,7 @@ before `VAProfileNone`. So on the M4:
 |---|---|---|
 | `vaQueryConfigEntrypoints` | `VLD` when decodable (unchanged) | `VLD` when decodable, then `EncSlice` when encodable |
 | `vaCreateConfig` / `vaGetConfigAttributes` | Previous logic, unchanged | Takes the encode branch only for `EncSlice` with an encodable profile; everything else falls through to the previous logic |
-| `vaQuerySurfaceAttributes` on an encode config | n/a | The same 8 attributes `ave_drv_video.so` reported: pixel format, memory types, external buffer descriptor, min/max size |
+| `vaQuerySurfaceAttributes` on an encode config | n/a | The same 8 attributes `ave_drv_video.so` reported: pixel format, memory types, external buffer descriptor, usage hint, min/max size |
 | Encode config attributes | n/a | RT format; `CBR \| VBR`; packed headers `NONE`; MaxRefFrames 1; MaxSlices 1; max picture width/height. Everything else `VA_ATTRIB_NOT_SUPPORTED`. |
 
 Chrome sees H.264 CB/Main/High encode with min 321x241 and max 4096x2304,

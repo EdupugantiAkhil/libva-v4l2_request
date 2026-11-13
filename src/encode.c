@@ -152,8 +152,11 @@ struct v4l2r_encode {
 
 	uint32_t frames_per_second;
 	uint64_t sequence;		/* pictures submitted */
-	uint64_t delivery_sequence;	/* next coded buffer to hand out */
 	uint32_t bitrate;
+	/* Fixed once the session is open: AVE takes only a new average bit
+	 * rate midstream. */
+	struct ave_rate_settings opened_rate;
+	bool ignored_rate_change;	/* reported once */
 	unsigned int keyframe_misses;
 };
 
@@ -508,7 +511,6 @@ VAStatus v4l2r_encode_context_create(struct v4l2r_context *ctx,
 	enc->width = (unsigned int)width;
 	enc->height = (unsigned int)height;
 	enc->target = VA_INVALID_ID;
-	enc->delivery_sequence = 1;
 	ctx->enc = enc;
 
 	v4l2r_diag(ctx, V4L2R_DIAG_LEVEL_INFO, V4L2R_DIAG_INFO, "create-context", 0,
@@ -847,18 +849,22 @@ static int store_packet(const struct ave_packet *packet, void *opaque)
 			break;
 		}
 	}
+	/* A frame whose coded buffer was destroyed or whose submission was
+	 * rolled back: drop its packets so the CAPTURE buffer is recycled. */
 	if (!buffer)
-		return -ENOENT;
+		return 0;
 	coded = buffer->coded;
 
 	capacity = v4l2r_buffer_bytes(buffer);
 	if (packet->size > capacity - coded->size) {
+		/* Keep what fits and still finish the frame below, so the
+		 * picture completes with the overflow status set. */
 		coded->segment.status |= VA_CODED_BUF_STATUS_FRAME_SIZE_OVERFLOW;
-		return -ENOSPC;
+	} else {
+		memcpy((uint8_t *)buffer->data + coded->size, packet->data,
+		       packet->size);
+		coded->size += packet->size;
 	}
-
-	memcpy((uint8_t *)buffer->data + coded->size, packet->data, packet->size);
-	coded->size += packet->size;
 	coded->packets++;
 	coded->segment.size = (uint32_t)coded->size;
 	coded->segment.buf = buffer->data;
@@ -906,8 +912,9 @@ static int store_output_done(uint64_t tag, void *opaque)
 		}
 	}
 	pthread_mutex_unlock(&drv->mutex);
+	/* The coded buffer was destroyed or reused meanwhile: nothing to do. */
 	if (!found)
-		return -ENOENT;
+		return 0;
 
 	found->coded->input_done = true;
 	finish_input(drv, found, found_id);
@@ -1235,6 +1242,7 @@ static int open_encoder(struct v4l2r_encode *enc,
 	enc->encode_height = encode_height;
 	enc->frames_per_second = config->frames_per_second;
 	enc->bitrate = rate->bitrate;
+	enc->opened_rate = *rate;
 	return 0;
 }
 
@@ -1409,6 +1417,26 @@ static int update_rate(struct v4l2r_encode *enc,
 					   sequence_bits_per_second, &rate);
 	if (status < 0)
 		return status;
+	/*
+	 * apple-ave applies a new average bit rate midstream, nothing else.
+	 * Refusing the picture would end WebRTC-style sessions that adapt
+	 * frame rate and peak continuously, so other changes keep the values
+	 * from the first picture and are reported once.
+	 */
+	if (!enc->ignored_rate_change &&
+	    (rate.v4l2_mode != enc->opened_rate.v4l2_mode ||
+	     rate.peak != enc->opened_rate.peak ||
+	     rate.qp_range != enc->opened_rate.qp_range ||
+	     rate.min_qp != enc->opened_rate.min_qp ||
+	     rate.max_qp != enc->opened_rate.max_qp ||
+	     (enc->pic.rate.frame_rate_seen &&
+	      enc->pic.rate.frames_per_second != enc->frames_per_second))) {
+		enc->ignored_rate_change = true;
+		v4l2r_diag(enc->ctx, V4L2R_DIAG_LEVEL_WARNING, V4L2R_DIAG_CLIENT,
+			   "encode-rate", 0,
+			   "only the average bit rate can change after the first "
+			   "picture; keeping frame rate, peak and QP limits");
+	}
 	if (rate.bitrate == enc->bitrate)
 		return 0;
 	status = ave_encoder_set_bitrate(enc->encoder, rate.bitrate);
@@ -1541,6 +1569,15 @@ static VAStatus encode_picture(struct v4l2r_context *ctx)
 		enc->sequence++;
 	tag = 1u + (enc->sequence - 1u) * 1000000u / enc->frames_per_second;
 
+	/* Reusing a coded buffer: its previous input no longer waits on it. */
+	{
+		struct v4l2r_surface *previous = find_surface(drv, coded->coded->source);
+
+		if (previous && previous->encode_coded == coded_id) {
+			previous->encode_pending = false;
+			previous->encode_coded = VA_INVALID_ID;
+		}
+	}
 	coded->coded->size = 0;
 	coded->coded->ready = false;
 	coded->coded->delivered = false;
@@ -1565,12 +1602,13 @@ static VAStatus encode_picture(struct v4l2r_context *ctx)
 
 	status = ave_encoder_submit(enc->encoder, &input.frame, tag,
 				    store_packet, enc);
-	{
-		int sync_status = input_release(&input);
-
-		if (sync_status < 0 && status == 0)
-			status = sync_status;
-	}
+	/* The pixels are copied by now; a failing DMA_BUF_SYNC end does not
+	 * undo a frame AVE already has, so it is only reported. */
+	if (input_release(&input) < 0)
+		v4l2r_diag(ctx, V4L2R_DIAG_LEVEL_WARNING, V4L2R_DIAG_CLIENT,
+			   "encode-input", 0,
+			   "ending CPU access to imported surface 0x%08x failed",
+			   surface->id);
 	if (status < 0) {
 		rollback_coded(enc, coded, coded_id);
 		surface->encode_pending = false;
@@ -1691,6 +1729,29 @@ static VAStatus sync_coded(struct v4l2r_driver *drv, struct v4l2r_buffer *buffer
 	return pump_until(ctx->enc, &buffer->coded->ready, timeout_ms);
 }
 
+/* Another coded buffer of the same context, submitted earlier, not done. */
+static bool earlier_in_flight(struct v4l2r_driver *drv,
+			      const struct v4l2r_buffer *buffer)
+{
+	struct v4l2r_buffer *other;
+	unsigned int iter = 0;
+	uint32_t id;
+	bool found = false;
+
+	pthread_mutex_lock(&drv->mutex);
+	while ((other = v4l2r_handles_next(&drv->buffers, &iter, &id))) {
+		if (other != buffer && other->coded &&
+		    other->context_id == buffer->context_id &&
+		    other->coded->tag && !other->coded->ready &&
+		    other->coded->sequence < buffer->coded->sequence) {
+			found = true;
+			break;
+		}
+	}
+	pthread_mutex_unlock(&drv->mutex);
+	return found;
+}
+
 /*
  * Hand out coded buffers in submission order. A client mapping the buffers
  * of one context from several threads gets them in order; the api mutex is
@@ -1713,9 +1774,7 @@ static VAStatus wait_delivery(struct v4l2r_driver *drv, VABufferID id,
 		return VA_STATUS_SUCCESS;
 	}
 
-	while (buffer->coded->sequence != ctx->enc->delivery_sequence) {
-		if (buffer->coded->sequence < ctx->enc->delivery_sequence)
-			return VA_STATUS_ERROR_OPERATION_FAILED;
+	while (earlier_in_flight(drv, buffer)) {
 		if (attempts++ >= 5000)
 			return VA_STATUS_ERROR_HW_BUSY;
 
@@ -1731,10 +1790,7 @@ static VAStatus wait_delivery(struct v4l2r_driver *drv, VABufferID id,
 			break;
 	}
 
-	if (!buffer->coded->delivered) {
-		ctx->enc->delivery_sequence++;
-		buffer->coded->delivered = true;
-	}
+	buffer->coded->delivered = true;
 	*result = buffer;
 	return VA_STATUS_SUCCESS;
 }

@@ -212,9 +212,15 @@ VAStatus v4l2r_SyncSurface(VADriverContextP va_ctx, VASurfaceID render_target)
 	if (!surface)
 		return VA_STATUS_ERROR_INVALID_SURFACE;
 
-	/* An encode input: wait for its coded frame (encode.c). */
-	if (surface->encode_pending)
-		return v4l2r_encode_sync_surface(drv, surface);
+	/* An encode input: wait for its coded frame (encode.c). Encode copied
+	 * the pixels at vaEndPicture, so a decode may have been queued into
+	 * the surface since; wait for that too. */
+	if (surface->encode_pending) {
+		VAStatus encode_status = v4l2r_encode_sync_surface(drv, surface);
+
+		if (encode_status != VA_STATUS_SUCCESS)
+			return encode_status;
+	}
 
 	return v4l2r_surface_ready(surface);
 }
@@ -235,7 +241,9 @@ VAStatus v4l2r_QuerySurfaceStatus(VADriverContextP va_ctx,
 
 	if (surface->encode_pending) {
 		v4l2r_encode_query_surface(drv, surface, status);
-		return VA_STATUS_SUCCESS;
+		if (*status != VASurfaceReady)
+			return VA_STATUS_SUCCESS;
+		/* Encode done; fall through for any later decode. */
 	}
 
 	/* A frame held back for reordering reports rendering until submitted. */
