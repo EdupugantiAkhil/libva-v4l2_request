@@ -398,3 +398,21 @@ if conf.get('HAVE_V4L2_CTRL_AV1') == 1
     endforeach
   endforeach
 endif
+
+# AVE encoding (docs/AVE_ENCODE.md): units, capability answers with and
+# without an encoder, Chrome and FFmpeg call sequences against a model
+# apple-ave node, DRM PRIME imports and encode/decode surface lifetimes.
+if have_ave_encode
+  ave_encode = executable('ave-encode', 'ave-encode.c', driver_sources,
+    c_args: ['-UNDEBUG'],
+    include_directories: [root_inc, include_directories('../src')],
+    dependencies: [libva_dep, libdrm_dep, threads_dep],
+    link_args: ['-Wl,--wrap=ioctl', '-Wl,--wrap=poll', '-Wl,--wrap=__poll_chk',
+                '-Wl,--wrap=open', '-Wl,--wrap=close', '-Wl,--wrap=mmap',
+                '-Wl,--wrap=munmap', '-Wl,--wrap=open64', '-Wl,--wrap=__open_2',
+                '-Wl,--wrap=__open64_2', '-Wl,--wrap=mmap64'])
+  foreach case : ['units', 'capabilities', 'decode-isolation', 'chrome', 'ffmpeg',
+                  'import', 'lifetime']
+    test('ave-encode-' + case, ave_encode, args: [case], timeout: 30)
+  endforeach
+endif
