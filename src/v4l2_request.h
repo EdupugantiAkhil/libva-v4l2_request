@@ -39,6 +39,7 @@
 #include <va/va_vpp.h>
 
 #include "config.h"
+#include "ave_encoder.h"
 
 /* Monotonic timestamp in nanoseconds, for measuring how long waits block. */
 static inline uint64_t v4l2r_now_ns(void)
@@ -82,6 +83,9 @@ static inline uint64_t v4l2r_now_ns(void)
 struct v4l2r_driver;
 struct v4l2r_context;
 struct v4l2r_codec;
+struct v4l2r_encode;
+struct v4l2r_coded;
+struct v4l2r_surface_import;
 
 bool v4l2r_trace_enabled(void);
 void v4l2r_trace(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -255,6 +259,9 @@ struct v4l2r_config {
 	unsigned int rt_format;
 	VAConfigAttrib attributes[V4L2R_MAX_CONFIG_ATTRIBUTES];
 	int nb_attributes;
+	/* VAEntrypointEncSlice only (encode.c); codec is NULL for those. */
+	uint32_t rate_control;
+	uint32_t packed_headers;
 };
 
 /*
@@ -295,6 +302,12 @@ struct v4l2r_surface {
 	bool convert_pending;
 	/* Codec scratch, e.g. the AV1 order hint of the decoded frame. */
 	uint32_t codec_tag;
+	/* Encode input state (encode.c), protected by drv->api_mutex: an
+	 * imported read-only DMA-BUF, and the encode reading this surface. */
+	struct v4l2r_surface_import *import;
+	bool encode_pending;
+	VAContextID encode_context;
+	VABufferID encode_coded;
 };
 
 /*
@@ -372,6 +385,8 @@ struct v4l2r_buffer {
 	bool derived;
 	/* Image storage has a fixed layout and is released by DestroyImage. */
 	bool image_owned;
+	/* VAEncCodedBufferType state (encode.c), NULL for other types. */
+	struct v4l2r_coded *coded;
 };
 
 struct v4l2r_image {
@@ -456,6 +471,10 @@ struct v4l2r_context {
 	/* Video processing state for VAEntrypointVideoProc contexts; such
 	 * contexts have no codec, decoder device or queues. See convert.c. */
 	struct v4l2r_vpp *vpp;
+
+	/* Encode state for VAEntrypointEncSlice contexts; such contexts have
+	 * no codec, decoder device or queues either. See encode.c. */
+	struct v4l2r_encode *enc;
 };
 
 /*
@@ -616,6 +635,9 @@ struct v4l2r_driver {
 	struct v4l2r_converter converter;
 	bool converter_probed;
 	bool has_converter;
+
+	/* Stateful apple-ave encoder found at init (encode.c). */
+	struct ave_device ave;
 };
 
 void v4l2r_lock_surface_api(struct VADriverVTable *vtable);
@@ -882,6 +904,189 @@ int v4l2r_export_capture_dmabufs(struct v4l2r_context *ctx,
  * destination format (NV12 at the converter CAPTURE layout). */
 VAStatus v4l2r_surface_convert_backing(struct v4l2r_driver *drv,
 				       struct v4l2r_surface *surface);
+
+/* --- AVE encoding (encode.c), see docs/AVE_ENCODE.md ---
+ *
+ * Built with -Dave_encode (HAVE_AVE_ENCODE); otherwise the inline stubs
+ * below keep every hook a no-op and drv->ave.present false. */
+
+#if HAVE_AVE_ENCODE
+void v4l2r_encode_probe(struct v4l2r_driver *drv);
+bool v4l2r_encode_profile_supported(const struct v4l2r_driver *drv,
+				    VAProfile profile);
+unsigned int v4l2r_encode_profiles(const struct v4l2r_driver *drv,
+				   VAProfile *profiles, unsigned int max);
+VAStatus v4l2r_encode_get_config_attributes(const struct v4l2r_driver *drv,
+					    VAProfile profile,
+					    VAConfigAttrib *attributes,
+					    int count);
+VAStatus v4l2r_encode_create_config(const struct v4l2r_driver *drv,
+				    VAProfile profile,
+				    const VAConfigAttrib *attributes,
+				    int count, struct v4l2r_config *config);
+VAStatus v4l2r_encode_surface_attributes(const struct v4l2r_config *config,
+					 VASurfaceAttrib *list,
+					 unsigned int *count);
+VAStatus v4l2r_encode_context_create(struct v4l2r_context *ctx,
+				     const struct v4l2r_config *config,
+				     int width, int height,
+				     const VASurfaceID *targets, int count);
+void v4l2r_encode_context_destroy(struct v4l2r_context *ctx);
+VAStatus v4l2r_encode_begin_picture(struct v4l2r_context *ctx,
+				    struct v4l2r_surface *surface);
+VAStatus v4l2r_encode_render_buffer(struct v4l2r_context *ctx,
+				    struct v4l2r_buffer *buffer);
+VAStatus v4l2r_encode_end_picture(struct v4l2r_context *ctx);
+/* Pixel format an encode input surface holds (import, attribute or RT). */
+uint32_t v4l2r_encode_surface_fourcc(const struct v4l2r_surface *surface);
+VAStatus v4l2r_encode_import_surface(struct v4l2r_driver *drv,
+				     struct v4l2r_surface *surface,
+				     uint32_t memory_type, const void *descriptor);
+void v4l2r_surface_free_import(struct v4l2r_surface *surface);
+/* Wait for the encode reading this surface (api_mutex held). */
+VAStatus v4l2r_encode_sync_surface(struct v4l2r_driver *drv,
+				   struct v4l2r_surface *surface);
+void v4l2r_encode_query_surface(struct v4l2r_driver *drv,
+				struct v4l2r_surface *surface,
+				VASurfaceStatus *status);
+/* Coded buffers: state allocated at creation. map_coded takes api_mutex;
+ * destroy_coded expects the caller to hold it. */
+VAStatus v4l2r_encode_buffer_init(struct v4l2r_buffer *buffer);
+VAStatus v4l2r_encode_map_coded(struct v4l2r_driver *drv, VABufferID id,
+				void **mapped);
+VAStatus v4l2r_encode_destroy_coded(struct v4l2r_driver *drv,
+				    struct v4l2r_buffer *buffer);
+#if VA_CHECK_VERSION(1, 9, 0)
+VAStatus v4l2r_SyncBuffer(VADriverContextP va_ctx, VABufferID buf_id,
+			  uint64_t timeout_ns);
+#endif
+#else
+static inline void v4l2r_encode_probe(struct v4l2r_driver *drv)
+{
+	(void)drv;
+}
+
+static inline bool v4l2r_encode_profile_supported(const struct v4l2r_driver *drv,
+						  VAProfile profile)
+{
+	(void)drv; (void)profile;
+	return false;
+}
+
+static inline unsigned int v4l2r_encode_profiles(const struct v4l2r_driver *drv,
+						 VAProfile *profiles,
+						 unsigned int max)
+{
+	(void)drv; (void)profiles; (void)max;
+	return 0;
+}
+
+static inline VAStatus v4l2r_encode_get_config_attributes(
+	const struct v4l2r_driver *drv, VAProfile profile,
+	VAConfigAttrib *attributes, int count)
+{
+	(void)drv; (void)profile; (void)attributes; (void)count;
+	return VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT;
+}
+
+static inline VAStatus v4l2r_encode_create_config(
+	const struct v4l2r_driver *drv, VAProfile profile,
+	const VAConfigAttrib *attributes, int count, struct v4l2r_config *config)
+{
+	(void)drv; (void)profile; (void)attributes; (void)count; (void)config;
+	return VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT;
+}
+
+static inline VAStatus v4l2r_encode_surface_attributes(
+	const struct v4l2r_config *config, VASurfaceAttrib *list,
+	unsigned int *count)
+{
+	(void)config; (void)list; (void)count;
+	return VA_STATUS_ERROR_INVALID_CONFIG;
+}
+
+static inline VAStatus v4l2r_encode_context_create(
+	struct v4l2r_context *ctx, const struct v4l2r_config *config,
+	int width, int height, const VASurfaceID *targets, int count)
+{
+	(void)ctx; (void)config; (void)width; (void)height; (void)targets;
+	(void)count;
+	return VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT;
+}
+
+static inline void v4l2r_encode_context_destroy(struct v4l2r_context *ctx)
+{
+	(void)ctx;
+}
+
+static inline VAStatus v4l2r_encode_begin_picture(struct v4l2r_context *ctx,
+						  struct v4l2r_surface *surface)
+{
+	(void)ctx; (void)surface;
+	return VA_STATUS_ERROR_INVALID_CONTEXT;
+}
+
+static inline VAStatus v4l2r_encode_render_buffer(struct v4l2r_context *ctx,
+						  struct v4l2r_buffer *buffer)
+{
+	(void)ctx; (void)buffer;
+	return VA_STATUS_ERROR_INVALID_CONTEXT;
+}
+
+static inline VAStatus v4l2r_encode_end_picture(struct v4l2r_context *ctx)
+{
+	(void)ctx;
+	return VA_STATUS_ERROR_INVALID_CONTEXT;
+}
+
+static inline VAStatus v4l2r_encode_import_surface(
+	struct v4l2r_driver *drv, struct v4l2r_surface *surface,
+	uint32_t memory_type, const void *descriptor)
+{
+	(void)drv; (void)surface; (void)memory_type; (void)descriptor;
+	return VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
+}
+
+static inline void v4l2r_surface_free_import(struct v4l2r_surface *surface)
+{
+	(void)surface;
+}
+
+static inline VAStatus v4l2r_encode_sync_surface(struct v4l2r_driver *drv,
+						 struct v4l2r_surface *surface)
+{
+	(void)drv; (void)surface;
+	return VA_STATUS_SUCCESS;
+}
+
+static inline void v4l2r_encode_query_surface(struct v4l2r_driver *drv,
+					      struct v4l2r_surface *surface,
+					      VASurfaceStatus *status)
+{
+	(void)drv; (void)surface;
+	*status = VASurfaceReady;
+}
+
+static inline VAStatus v4l2r_encode_buffer_init(struct v4l2r_buffer *buffer)
+{
+	(void)buffer;
+	return VA_STATUS_SUCCESS;
+}
+
+static inline VAStatus v4l2r_encode_map_coded(struct v4l2r_driver *drv,
+					      VABufferID id, void **mapped)
+{
+	(void)drv; (void)id; (void)mapped;
+	return VA_STATUS_ERROR_INVALID_BUFFER;
+}
+
+static inline VAStatus v4l2r_encode_destroy_coded(struct v4l2r_driver *drv,
+						  struct v4l2r_buffer *buffer)
+{
+	(void)drv; (void)buffer;
+	return VA_STATUS_SUCCESS;
+}
+#endif
 
 /* --- codec table --- */
 

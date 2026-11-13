@@ -98,6 +98,41 @@ conf.set10('HAVE_HEVC_DECODE_PARAMS_NUM_DELTA_POCS',
                          'num_delta_pocs_of_ref_rps_idx',
                          prefix: '#include <linux/videodev2.h>'))
 
+# Stateful AVE encoding (src/encode.c): needs the VA encode parameter
+# structures, DRM PRIME import descriptors, the stateful V4L2 H.264/HEVC
+# encoder controls and DMA-BUF CPU access synchronization.
+ave_encode_check = '''
+#include <stddef.h>
+#include <stdint.h>
+#include <linux/dma-buf.h>
+#include <linux/videodev2.h>
+#include <va/va.h>
+#include <va/va_drmcommon.h>
+#include <va/va_enc_h264.h>
+#include <va/va_enc_hevc.h>
+int a = V4L2_CID_MPEG_VIDEO_HEVC_PROFILE;
+int b = V4L2_PIX_FMT_HEVC;
+unsigned long c = DMA_BUF_IOCTL_SYNC;
+VADRMPRIMESurfaceDescriptor d;
+VAEncSequenceParameterBufferHEVC e;
+'''
+have_ave_encode = false
+if not get_option('ave_encode').disabled()
+  have_ave_encode = cc.compiles(ave_encode_check, dependencies: libva_dep,
+                                name: 'headers provide stateful AVE encoding')
+  if get_option('ave_encode').enabled() and not have_ave_encode
+    error('-Dave_encode=enabled, but the libva/kernel headers lack the VA encode, DRM PRIME, DMA-BUF sync or V4L2 HEVC encoder definitions')
+  endif
+endif
+conf.set10('HAVE_AVE_ENCODE', have_ave_encode)
+if have_ave_encode
+  codec_report += 'ave encode: auto-detected'
+elif get_option('ave_encode').disabled()
+  codec_report += 'ave encode: disabled (-Dave_encode=disabled)'
+else
+  codec_report += 'ave encode: not available (libva/kernel headers)'
+endif
+
 summary({'codecs': '\n  '.join([''] + codec_report)})
 
 configure_file(output: 'config.h', configuration: conf)

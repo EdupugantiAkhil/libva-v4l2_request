@@ -33,6 +33,9 @@ VAStatus v4l2r_CreateSurfaces2(VADriverContextP va_ctx, unsigned int format,
 {
 	V4L2R_OVERLAP_UNLOCKED();
 	struct v4l2r_driver *drv = v4l2r_driver(va_ctx);
+	uint32_t memory_type = VA_SURFACE_ATTRIB_MEM_TYPE_VA;
+	const void *descriptor = NULL;
+	bool import = false;
 	uint32_t fourcc = 0;
 	unsigned int i;
 
@@ -49,6 +52,26 @@ VAStatus v4l2r_CreateSurfaces2(VADriverContextP va_ctx, unsigned int format,
 			if (fourcc != VA_FOURCC_NV12 && fourcc != VA_FOURCC_P010)
 				return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
 		}
+		if (attrib_list[i].type == VASurfaceAttribMemoryType &&
+		    attrib_list[i].value.type == VAGenericValueTypeInteger)
+			memory_type = (uint32_t)attrib_list[i].value.value.i;
+		if (attrib_list[i].type == VASurfaceAttribExternalBufferDescriptor &&
+		    attrib_list[i].value.type == VAGenericValueTypePointer)
+			descriptor = attrib_list[i].value.value.p;
+	}
+
+	/*
+	 * Imported DMA-BUFs are encode inputs (e.g. Chrome WebCodecs frames):
+	 * mapped read-only and copied into the encoder at EndPicture. Without
+	 * an encoder the import attributes keep their previous meaning (none).
+	 */
+	if (drv->ave.present && descriptor &&
+	    (memory_type == VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME ||
+	     memory_type == VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2)) {
+		/* One descriptor describes one buffer. */
+		if (num_surfaces != 1)
+			return VA_STATUS_ERROR_INVALID_PARAMETER;
+		import = true;
 	}
 
 	for (i = 0; i < num_surfaces; i++) {
@@ -69,6 +92,20 @@ VAStatus v4l2r_CreateSurfaces2(VADriverContextP va_ctx, unsigned int format,
 		surface->fourcc = fourcc;
 		surface->capture_index = -1;
 		surface->status = VASurfaceReady;
+		surface->encode_context = VA_INVALID_ID;
+		surface->encode_coded = VA_INVALID_ID;
+
+		if (import) {
+			VAStatus status = v4l2r_encode_import_surface(drv, surface,
+								      memory_type,
+								      descriptor);
+			if (status != VA_STATUS_SUCCESS) {
+				pthread_mutex_lock(&drv->mutex);
+				v4l2r_handles_free(&drv->surfaces, id);
+				pthread_mutex_unlock(&drv->mutex);
+				return status;
+			}
+		}
 
 		surfaces[i] = id;
 	}
@@ -140,6 +177,11 @@ VAStatus v4l2r_DestroySurfaces(VADriverContextP va_ctx, VASurfaceID *surface_lis
 		if (!surface)
 			return VA_STATUS_ERROR_INVALID_SURFACE;
 
+		/* An encode copied the pixels at EndPicture; finish it so its
+		 * coded buffer completes before the input disappears. */
+		if (surface->encode_pending)
+			v4l2r_encode_sync_surface(drv, surface);
+
 		/* Wait for any pending decode (and conversion, which holds a
 		 * pointer to the surface); the CAPTURE buffer itself stays
 		 * with the context (V4L2 cannot free single buffers) but is
@@ -151,6 +193,7 @@ VAStatus v4l2r_DestroySurfaces(VADriverContextP va_ctx, VASurfaceID *surface_lis
 						      surface->capture_index);
 
 		v4l2r_surface_free_backing(surface);
+		v4l2r_surface_free_import(surface);
 
 		pthread_mutex_lock(&drv->mutex);
 		v4l2r_handles_free(&drv->surfaces, surface_list[i]);
@@ -169,6 +212,10 @@ VAStatus v4l2r_SyncSurface(VADriverContextP va_ctx, VASurfaceID render_target)
 	if (!surface)
 		return VA_STATUS_ERROR_INVALID_SURFACE;
 
+	/* An encode input: wait for its coded frame (encode.c). */
+	if (surface->encode_pending)
+		return v4l2r_encode_sync_surface(drv, surface);
+
 	return v4l2r_surface_ready(surface);
 }
 
@@ -185,6 +232,11 @@ VAStatus v4l2r_QuerySurfaceStatus(VADriverContextP va_ctx,
 	surface = V4L2R_SURFACE_GET(drv, render_target);
 	if (!surface)
 		return VA_STATUS_ERROR_INVALID_SURFACE;
+
+	if (surface->encode_pending) {
+		v4l2r_encode_query_surface(drv, surface, status);
+		return VA_STATUS_SUCCESS;
+	}
 
 	/* A frame held back for reordering reports rendering until submitted. */
 	if (surface->ctx && surface->ctx->in_picture &&
@@ -233,6 +285,9 @@ VAStatus v4l2r_QuerySurfaceAttributes(VADriverContextP va_ctx, VAConfigID config
 	snapshot = *cfg;
 	pthread_mutex_unlock(&drv->mutex);
 	cfg = &snapshot;
+
+	if (cfg->entrypoint == VAEntrypointEncSlice)
+		return v4l2r_encode_surface_attributes(cfg, attrib_list, num_attribs);
 
 	if (!attrib_list) {
 		*num_attribs = 8;
@@ -839,6 +894,10 @@ VAStatus v4l2r_surface_view(struct v4l2r_driver *drv,
 			    struct v4l2r_frame_view *view)
 {
 	memset(view, 0, sizeof(*view));
+
+	/* Imported encode inputs are read-only and only read by encode.c. */
+	if (surface->import)
+		return VA_STATUS_ERROR_OPERATION_FAILED;
 
 	/* With a conversion chain the decode CAPTURE buffer holds the raw
 	 * decoder format; what clients see is the converted NV12 backing. */

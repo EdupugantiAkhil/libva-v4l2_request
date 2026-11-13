@@ -1122,6 +1122,19 @@ VAStatus v4l2r_CreateContext(VADriverContextP va_ctx, VAConfigID config_id,
 		for (unsigned int p = 0; p < VIDEO_MAX_PLANES; p++)
 			ctx->captures[i].dmabuf_fd[p] = -1;
 
+	/* Encode contexts drive the apple-ave stateful encoder (encode.c):
+	 * no codec, no decoder device, no request queues. */
+	if (config->entrypoint == VAEntrypointEncSlice) {
+		status = v4l2r_encode_context_create(ctx, config, picture_width,
+						     picture_height, render_targets,
+						     num_render_targets);
+		if (status != VA_STATUS_SUCCESS)
+			goto fail;
+
+		*context_id = id;
+		return VA_STATUS_SUCCESS;
+	}
+
 	/* Video processing contexts drive the format converter instead of a
 	 * decoder: no codec, no decoder device, no queues. */
 	if (!ctx->codec) {
@@ -1339,6 +1352,9 @@ VAStatus v4l2r_DestroyContext(VADriverContextP va_ctx, VAContextID context_id)
 	if (!ctx)
 		return VA_STATUS_ERROR_INVALID_CONTEXT;
 
+	/* Encode contexts own an encoder session and no decoder resources. */
+	v4l2r_encode_context_destroy(ctx);
+
 	/* A missing EndPicture cannot leave a successful frame behind or
 	 * submit an incomplete held-back picture during teardown. */
 	abandoned = ctx->in_picture ? ctx->pic.target : NULL;
@@ -1462,6 +1478,19 @@ VAStatus v4l2r_BeginPicture(VADriverContextP va_ctx, VAContextID context_id,
 			   render_target);
 		return VA_STATUS_ERROR_INVALID_SURFACE;
 	}
+	/* An encode only reads its input, whichever context decoded it. */
+	if (ctx->enc) {
+		ctx->picture_status = VA_STATUS_SUCCESS;
+		return v4l2r_encode_begin_picture(ctx, surface);
+	}
+	/* Imported DMA-BUFs are read-only encode inputs. */
+	if (surface->import) {
+		v4l2r_diag(ctx, V4L2R_DIAG_LEVEL_DEBUG, V4L2R_DIAG_CLIENT,
+			   "begin-picture", 0,
+			   "render target 0x%08x is an imported encode input",
+			   render_target);
+		return VA_STATUS_ERROR_INVALID_SURFACE;
+	}
 	if (surface->ctx && surface->ctx != ctx) {
 		v4l2r_diag(ctx, V4L2R_DIAG_LEVEL_DEBUG, V4L2R_DIAG_CLIENT,
 			   "begin-picture", 0,
@@ -1525,7 +1554,8 @@ VAStatus v4l2r_RenderPicture(VADriverContextP va_ctx, VAContextID context_id,
 			return ctx->picture_status;
 		}
 
-		status = ctx->vpp ? v4l2r_vpp_render_buffer(ctx, buffer) :
+		status = ctx->enc ? v4l2r_encode_render_buffer(ctx, buffer) :
+			 ctx->vpp ? v4l2r_vpp_render_buffer(ctx, buffer) :
 			 ctx->codec->render_buffer(ctx, buffer);
 		if (status != VA_STATUS_SUCCESS) {
 			ctx->picture_status = status;
@@ -1550,6 +1580,9 @@ VAStatus v4l2r_EndPicture(VADriverContextP va_ctx, VAContextID context_id)
 			   "end-picture", 0, "EndPicture without BeginPicture");
 		return VA_STATUS_ERROR_OPERATION_FAILED;
 	}
+
+	if (ctx->enc)
+		return v4l2r_encode_end_picture(ctx);
 
 	status = ctx->picture_status;
 	if (status == VA_STATUS_SUCCESS)

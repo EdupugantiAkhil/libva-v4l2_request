@@ -24,7 +24,10 @@ VAStatus v4l2r_CreateBuffer(VADriverContextP va_ctx, VAContextID context_id,
 	V4L2R_OVERLAP_UNLOCKED();
 	struct v4l2r_driver *drv = v4l2r_driver(va_ctx);
 	struct v4l2r_buffer *buffer;
+	struct v4l2r_context *ctx;
+	bool decode_type = true;
 	VABufferID id;
+	VAStatus status;
 
 	if (!buf_id || !size || !num_elements || (size_t)num_elements > SIZE_MAX / size)
 		return VA_STATUS_ERROR_INVALID_PARAMETER;
@@ -39,12 +42,23 @@ VAStatus v4l2r_CreateBuffer(VADriverContextP va_ctx, VAContextID context_id,
 	case VAProcPipelineParameterBufferType:
 		break;
 	default:
-		return VA_STATUS_ERROR_UNSUPPORTED_BUFFERTYPE;
+		/* Encode parameter and coded buffers (encode.c) belong to an
+		 * encode context, which rejects what it cannot use at
+		 * EndPicture. Everything else keeps the old answer. */
+		if (!drv->ave.present)
+			return VA_STATUS_ERROR_UNSUPPORTED_BUFFERTYPE;
+		decode_type = false;
+		break;
 	}
 
 	pthread_mutex_lock(&drv->mutex);
+	ctx = V4L2R_CONTEXT(drv, context_id);
+	if (!decode_type && (!ctx || !ctx->enc)) {
+		pthread_mutex_unlock(&drv->mutex);
+		return VA_STATUS_ERROR_UNSUPPORTED_BUFFERTYPE;
+	}
 	/* Image storage is allocated internally, independently of a context. */
-	if (type != VAImageBufferType && !V4L2R_CONTEXT(drv, context_id)) {
+	if (type != VAImageBufferType && !ctx) {
 		pthread_mutex_unlock(&drv->mutex);
 		return VA_STATUS_ERROR_INVALID_CONTEXT;
 	}
@@ -71,6 +85,15 @@ VAStatus v4l2r_CreateBuffer(VADriverContextP va_ctx, VAContextID context_id,
 	if (data)
 		memcpy(buffer->data, data, (size_t)size * num_elements);
 
+	status = v4l2r_encode_buffer_init(buffer);
+	if (status != VA_STATUS_SUCCESS) {
+		free(buffer->data);
+		pthread_mutex_lock(&drv->mutex);
+		v4l2r_handles_free(&drv->buffers, id);
+		pthread_mutex_unlock(&drv->mutex);
+		return status;
+	}
+
 	*buf_id = id;
 	return VA_STATUS_SUCCESS;
 }
@@ -85,7 +108,8 @@ VAStatus v4l2r_BufferSetNumElements(VADriverContextP va_ctx, VABufferID buf_id,
 	if (!buffer)
 		return VA_STATUS_ERROR_INVALID_BUFFER;
 
-	if (buffer->derived || buffer->image_owned)
+	/* Coded buffers hand out a segment pointing at their storage. */
+	if (buffer->derived || buffer->image_owned || buffer->coded)
 		return VA_STATUS_ERROR_INVALID_BUFFER;
 	/* realloc(ptr, 0) may free ptr and return NULL; retaining it would
 	 * leave MapBuffer/DestroyBuffer using an already-freed allocation. */
@@ -117,6 +141,10 @@ VAStatus v4l2r_MapBuffer(VADriverContextP va_ctx, VABufferID buf_id, void **pbuf
 	if (!buffer)
 		return VA_STATUS_ERROR_INVALID_BUFFER;
 
+	/* Coded buffers wait for their frame and map as a segment list. */
+	if (buffer->coded)
+		return v4l2r_encode_map_coded(drv, buf_id, pbuf);
+
 	*pbuf = buffer->data;
 	return VA_STATUS_SUCCESS;
 }
@@ -134,10 +162,8 @@ VAStatus v4l2r_UnmapBuffer(VADriverContextP va_ctx, VABufferID buf_id)
 	return VA_STATUS_SUCCESS;
 }
 
-VAStatus v4l2r_DestroyBuffer(VADriverContextP va_ctx, VABufferID buf_id)
+static VAStatus destroy_buffer(struct v4l2r_driver *drv, VABufferID buf_id)
 {
-	V4L2R_OVERLAP_UNLOCKED();
-	struct v4l2r_driver *drv = v4l2r_driver(va_ctx);
 	struct v4l2r_buffer *buffer;
 
 	pthread_mutex_lock(&drv->mutex);
@@ -156,6 +182,29 @@ VAStatus v4l2r_DestroyBuffer(VADriverContextP va_ctx, VABufferID buf_id)
 	pthread_mutex_unlock(&drv->mutex);
 
 	return VA_STATUS_SUCCESS;
+}
+
+VAStatus v4l2r_DestroyBuffer(VADriverContextP va_ctx, VABufferID buf_id)
+{
+	V4L2R_OVERLAP_UNLOCKED();
+	struct v4l2r_driver *drv = v4l2r_driver(va_ctx);
+	struct v4l2r_buffer *buffer;
+	VAStatus status = VA_STATUS_SUCCESS;
+
+	buffer = V4L2R_BUFFER_GET(drv, buf_id);
+	if (!buffer || !buffer->coded)
+		return destroy_buffer(drv, buf_id);
+
+	/* A coded buffer may still be waiting for its frame; encode state is
+	 * serialized by the api mutex (encode.c). */
+	pthread_mutex_lock(&drv->api_mutex);
+	buffer = V4L2R_BUFFER_GET(drv, buf_id);
+	if (buffer && buffer->coded)
+		status = v4l2r_encode_destroy_coded(drv, buffer);
+	if (status == VA_STATUS_SUCCESS)
+		status = destroy_buffer(drv, buf_id);
+	pthread_mutex_unlock(&drv->api_mutex);
+	return status;
 }
 
 VAStatus v4l2r_BufferInfo(VADriverContextP va_ctx, VABufferID buf_id,

@@ -16,5 +16,12 @@ option('codec_vp9', type: 'feature', value: 'auto',
 option('codec_av1', type: 'feature', value: 'auto',
        description: 'AV1 stateless decoding (Linux UAPI >= 6.5)')
 
+# Stateful hardware encoding on the Apple AVE (apple-ave V4L2 encoder):
+# H.264 and HEVC Main/Main 10 through VAEntrypointEncSlice. auto builds it
+# when the libva/kernel headers provide what it needs; the device is only
+# used when present at runtime. See docs/AVE_ENCODE.md.
+option('ave_encode', type: 'feature', value: 'auto',
+       description: 'Apple AVE stateful H.264/HEVC encoding (apple-ave V4L2 encoder)')
+
 option('fuzzing', type: 'feature', value: 'disabled',
        description: 'Build libFuzzer campaign binaries (clang -fsanitize=fuzzer); 24 CPU-hour runs are not meson tests')

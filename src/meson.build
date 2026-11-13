@@ -18,6 +18,14 @@ driver_sources = files(
   'codec_av1.c',
 )
 
+if have_ave_encode
+  driver_sources += files(
+    'encode.c',
+    'ave_encoder.c',
+    'ave_params.c',
+  )
+endif
+
 shared_module('v4l2_request_drv_video',
               driver_sources,
               name_prefix: '',

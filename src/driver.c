@@ -748,6 +748,17 @@ VAStatus v4l2r_QueryConfigProfiles(VADriverContextP va_ctx, VAProfile *profiles,
 	}
 #endif
 
+	/* Encode-only profiles (the decode list above usually has them). */
+	VAProfile encode[8];
+	unsigned int nb_encode = v4l2r_encode_profiles(drv, encode, 8);
+	for (unsigned int i = 0; i < nb_encode; i++) {
+		bool listed = false;
+		for (int j = 0; j < count; j++)
+			listed |= profiles[j] == encode[i];
+		if (!listed && count < V4L2R_MAX_PROFILES)
+			profiles[count++] = encode[i];
+	}
+
 	/* Video processing. Listed unconditionally so plain decode clients
 	 * enumerating profiles never trigger the converter device scan; the
 	 * entrypoint query performs the actual probe. */
@@ -775,11 +786,12 @@ VAStatus v4l2r_QueryConfigEntrypoints(VADriverContextP va_ctx, VAProfile profile
 		if (v4l2r_converter_available(drv))
 			entrypoints[(*num_entrypoints)++] =
 				VAEntrypointVideoProc;
-	} else if (codec && driver_supports_profile(drv, profile)) {
-		entrypoints[0] = VAEntrypointVLD;
-		*num_entrypoints = 1;
 	} else {
 		*num_entrypoints = 0;
+		if (codec && driver_supports_profile(drv, profile))
+			entrypoints[(*num_entrypoints)++] = VAEntrypointVLD;
+		if (v4l2r_encode_profile_supported(drv, profile))
+			entrypoints[(*num_entrypoints)++] = VAEntrypointEncSlice;
 	}
 
 	return VA_STATUS_SUCCESS;
@@ -796,6 +808,31 @@ VAStatus v4l2r_CreateConfig(VADriverContextP va_ctx, VAProfile profile,
 
 	if (!config_id || num_attribs < 0 || (num_attribs && !attrib_list))
 		return VA_STATUS_ERROR_INVALID_PARAMETER;
+
+	/* Encoding runs on the apple-ave stateful encoder (encode.c). */
+	if (entrypoint == VAEntrypointEncSlice &&
+	    v4l2r_encode_profile_supported(drv, profile)) {
+		struct v4l2r_config encode = {0};
+		VAStatus status = v4l2r_encode_create_config(drv, profile,
+							     attrib_list,
+							     num_attribs, &encode);
+		if (status != VA_STATUS_SUCCESS) {
+			v4l2r_diag(NULL, V4L2R_DIAG_LEVEL_DEBUG,
+				   V4L2R_DIAG_UNSUPPORTED, "create-config", 0,
+				   "encode attributes for %s refused: %s",
+				   vaProfileStr(profile), vaErrorStr(status));
+			return status;
+		}
+		pthread_mutex_lock(&drv->mutex);
+		id = v4l2r_handles_alloc(&drv->configs, sizeof(*config));
+		config = V4L2R_CONFIG(drv, id);
+		pthread_mutex_unlock(&drv->mutex);
+		if (!config)
+			return VA_STATUS_ERROR_ALLOCATION_FAILED;
+		*config = encode;
+		*config_id = id;
+		return VA_STATUS_SUCCESS;
+	}
 
 	if (profile == VAProfileNone) {
 		/* Video processing (rotation/mirroring/scaling blits) runs
@@ -920,11 +957,15 @@ VAStatus v4l2r_GetConfigAttributes(VADriverContextP va_ctx, VAProfile profile,
 				   VAEntrypoint entrypoint,
 				   VAConfigAttrib *attrib_list, int num_attribs)
 {
-	(void)va_ctx;
-	(void)entrypoint;
+	struct v4l2r_driver *drv = v4l2r_driver(va_ctx);
 
 	if (num_attribs < 0 || (num_attribs && !attrib_list))
 		return VA_STATUS_ERROR_INVALID_PARAMETER;
+
+	if (entrypoint == VAEntrypointEncSlice &&
+	    v4l2r_encode_profile_supported(drv, profile))
+		return v4l2r_encode_get_config_attributes(drv, profile,
+							  attrib_list, num_attribs);
 
 	for (int i = 0; i < num_attribs; i++) {
 		switch (attrib_list[i].type) {
@@ -1085,6 +1126,9 @@ VAStatus V4L2R_DRIVER_INIT(VADriverContextP va_ctx)
 	vtable->vaQueryDisplayAttributes = v4l2r_QueryDisplayAttributes;
 	vtable->vaGetDisplayAttributes = v4l2r_GetDisplayAttributes;
 	vtable->vaSetDisplayAttributes = v4l2r_SetDisplayAttributes;
+#if HAVE_AVE_ENCODE && VA_CHECK_VERSION(1, 9, 0)
+	vtable->vaSyncBuffer = v4l2r_SyncBuffer;
+#endif
 
 	if (va_ctx->vtable_vpp) {
 		va_ctx->vtable_vpp->vaQueryVideoProcFilters =
@@ -1140,6 +1184,9 @@ VAStatus V4L2R_DRIVER_INIT(VADriverContextP va_ctx)
 	v4l2r_diag(NULL, V4L2R_DIAG_LEVEL_INFO, V4L2R_DIAG_INFO, "driver-init", 0,
 		   "detected %u Request API decoder%s", drv->nb_decoders,
 		   drv->nb_decoders == 1 ? "" : "s");
+	/* Stateful encoder, if any (needs a decoder too: client surfaces get
+	 * their storage from a decoder CAPTURE queue). */
+	v4l2r_encode_probe(drv);
 	v4l2r_diag_driver(drv);
 
 	return VA_STATUS_SUCCESS;
