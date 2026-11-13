@@ -156,7 +156,9 @@ struct v4l2r_encode {
 	/* Fixed once the session is open: AVE takes only a new average bit
 	 * rate midstream. */
 	struct ave_rate_settings opened_rate;
-	bool ignored_rate_change;	/* reported once */
+	VAEncSequenceParameterBufferHEVC opened_hevc;
+	uint32_t hevc_ctu_count;
+	bool failed;			/* a submit error cancels the session */
 	unsigned int keyframe_misses;
 };
 
@@ -519,7 +521,7 @@ VAStatus v4l2r_encode_context_create(struct v4l2r_context *ctx,
 	return VA_STATUS_SUCCESS;
 }
 
-void v4l2r_encode_context_destroy(struct v4l2r_context *ctx)
+static void cancel_encoder(struct v4l2r_context *ctx)
 {
 	struct v4l2r_driver *drv = ctx->drv;
 	struct v4l2r_encode *enc = ctx->enc;
@@ -549,8 +551,14 @@ void v4l2r_encode_context_destroy(struct v4l2r_context *ctx)
 			buffer->coded->tag = 0;
 	}
 	pthread_mutex_unlock(&drv->mutex);
+	enc->queue_count = 0;
+	enc->failed = true;
+}
 
-	free(enc);
+void v4l2r_encode_context_destroy(struct v4l2r_context *ctx)
+{
+	cancel_encoder(ctx);
+	free(ctx->enc);
 	ctx->enc = NULL;
 }
 
@@ -801,21 +809,6 @@ static void remove_queue_entry(struct v4l2r_encode *enc, size_t offset)
 	enc->queue_count--;
 }
 
-static void rollback_coded(struct v4l2r_encode *enc, struct v4l2r_buffer *buffer,
-			   VABufferID id)
-{
-	size_t tail;
-
-	if (!enc->queue_count)
-		return;
-	tail = (enc->queue_head + enc->queue_count - 1) % AVE_QUEUE_LENGTH;
-	if (enc->queue[tail] == id) {
-		enc->queue_count--;
-		buffer->coded->sequence = 0;
-		buffer->coded->tag = 0;
-	}
-}
-
 static void finish_input(struct v4l2r_driver *drv, struct v4l2r_buffer *buffer,
 			 VABufferID id)
 {
@@ -836,7 +829,7 @@ static int store_packet(const struct ave_packet *packet, void *opaque)
 	size_t capacity;
 	size_t offset;
 
-	if (!packet || !packet->tag || !enc->queue_count)
+	if (!packet || !packet->tag)
 		return -EINVAL;
 
 	for (offset = 0; offset < enc->queue_count; offset++) {
@@ -1383,6 +1376,8 @@ static int open_hevc(struct v4l2r_encode *enc, const struct v4l2r_surface *input
 	if (sequence->vui_num_units_in_tick && sequence->vui_time_scale)
 		vui_fps = sequence->vui_time_scale / sequence->vui_num_units_in_tick;
 
+	enc->opened_hevc = *sequence;
+	enc->hevc_ctu_count = ctu_count;
 	config.coded_format = V4L2_PIX_FMT_HEVC;
 #if HAVE_V4L2_PIX_FMT_P010
 	config.raw_format = main10 ? V4L2_PIX_FMT_P010 : V4L2_PIX_FMT_NV12;
@@ -1411,32 +1406,24 @@ static int update_rate(struct v4l2r_encode *enc,
 	struct ave_rate_settings rate;
 	int status;
 
+	/* Check frame-rate-only requests too, before the rate-control fast
+	 * path. Repeating the original value is harmless. */
+	if (enc->pic.rate.frame_rate_seen &&
+	    enc->pic.rate.frames_per_second != enc->frames_per_second)
+		return -ENOTSUP;
 	if (!enc->pic.rate.rate_seen && !sequence_bits_per_second)
 		return 0;
 	status = ave_rate_settings_from_va(enc->rate_control, &enc->pic.rate,
 					   sequence_bits_per_second, &rate);
 	if (status < 0)
 		return status;
-	/*
-	 * apple-ave applies a new average bit rate midstream, nothing else.
-	 * Refusing the picture would end WebRTC-style sessions that adapt
-	 * frame rate and peak continuously, so other changes keep the values
-	 * from the first picture and are reported once.
-	 */
-	if (!enc->ignored_rate_change &&
-	    (rate.v4l2_mode != enc->opened_rate.v4l2_mode ||
-	     rate.peak != enc->opened_rate.peak ||
-	     rate.qp_range != enc->opened_rate.qp_range ||
-	     rate.min_qp != enc->opened_rate.min_qp ||
-	     rate.max_qp != enc->opened_rate.max_qp ||
-	     (enc->pic.rate.frame_rate_seen &&
-	      enc->pic.rate.frames_per_second != enc->frames_per_second))) {
-		enc->ignored_rate_change = true;
-		v4l2r_diag(enc->ctx, V4L2R_DIAG_LEVEL_WARNING, V4L2R_DIAG_CLIENT,
-			   "encode-rate", 0,
-			   "only the average bit rate can change after the first "
-			   "picture; keeping frame rate, peak and QP limits");
-	}
+	if (rate.v4l2_mode != enc->opened_rate.v4l2_mode ||
+	    (enc->pic.rate.rate_seen &&
+	     (rate.peak != enc->opened_rate.peak ||
+	      rate.qp_range != enc->opened_rate.qp_range ||
+	      rate.min_qp != enc->opened_rate.min_qp ||
+	      rate.max_qp != enc->opened_rate.max_qp)))
+		return -ENOTSUP;
 	if (rate.bitrate == enc->bitrate)
 		return 0;
 	status = ave_encoder_set_bitrate(enc->encoder, rate.bitrate);
@@ -1453,8 +1440,35 @@ static int check_picture(const struct v4l2r_encode *enc)
 	if (pic->error)
 		return pic->error;
 	if (enc->hevc) {
+		const VAEncPictureParameterBufferHEVC *picture = &pic->picture.hevc;
+
 		if (!pic->have_picture || pic->slices != 1)
 			return -EINVAL;
+		if (picture->num_tile_columns_minus1 || picture->num_tile_rows_minus1 ||
+		    picture->pic_fields.bits.tiles_enabled_flag)
+			return -ENOTSUP;
+		if (enc->encoder && pic->num_ctu_in_slice != enc->hevc_ctu_count)
+			return -ENOTSUP;
+		if (enc->encoder && pic->have_sequence) {
+			const VAEncSequenceParameterBufferHEVC *seq = &pic->sequence.hevc;
+			const VAEncSequenceParameterBufferHEVC *initial = &enc->opened_hevc;
+
+			if (seq->general_profile_idc != initial->general_profile_idc ||
+			    seq->general_tier_flag != initial->general_tier_flag ||
+			    seq->general_level_idc != initial->general_level_idc ||
+			    seq->seq_fields.bits.chroma_format_idc != 1 ||
+			    seq->seq_fields.bits.bit_depth_luma_minus8 !=
+				initial->seq_fields.bits.bit_depth_luma_minus8 ||
+			    seq->seq_fields.bits.bit_depth_chroma_minus8 !=
+				initial->seq_fields.bits.bit_depth_chroma_minus8 ||
+			    seq->seq_fields.bits.separate_colour_plane_flag ||
+			    seq->seq_fields.bits.pcm_enabled_flag || seq->ip_period > 1 ||
+			    seq->log2_min_luma_coding_block_size_minus3 !=
+				initial->log2_min_luma_coding_block_size_minus3 ||
+			    seq->log2_diff_max_min_luma_coding_block_size !=
+				initial->log2_diff_max_min_luma_coding_block_size)
+				return -ENOTSUP;
+		}
 		if (pic->picture.hevc.pic_fields.bits.idr_pic_flag && !pic->intra)
 			return -ENOTSUP;
 		return 0;
@@ -1479,6 +1493,8 @@ static VAStatus encode_picture(struct v4l2r_context *ctx)
 	uint64_t tag;
 	int status;
 
+	if (enc->failed)
+		return VA_STATUS_ERROR_ENCODING_ERROR;
 	status = check_picture(enc);
 	if (status < 0)
 		return status_from_errno(status);
@@ -1491,6 +1507,21 @@ static VAStatus encode_picture(struct v4l2r_context *ctx)
 		return VA_STATUS_ERROR_INVALID_BUFFER;
 	if (!surface)
 		return VA_STATUS_ERROR_INVALID_SURFACE;
+	/* Do not reset a buffer still owned by the previous submission. In
+	 * particular EALREADY from queue_coded must never orphan its tag. */
+	if (coded->coded->tag && !coded->coded->ready)
+		return VA_STATUS_ERROR_HW_BUSY;
+	if (enc->queue_count >= AVE_QUEUE_LENGTH)
+		return VA_STATUS_ERROR_HW_BUSY;
+	/* CAPTURE can complete before OUTPUT is dequeued. Keep the previous
+	 * tag until both callbacks have run before reusing this VA buffer. */
+	if (coded->coded->tag && !coded->coded->input_done) {
+		status = ave_encoder_wait_output_idle(enc->encoder,
+						      AVE_MAP_TIMEOUT_MS,
+						      store_packet, enc);
+		if (status < 0)
+			return status_from_errno(status);
+	}
 
 	capacity = v4l2r_buffer_bytes(coded);
 	if (capacity == 0 || capacity > UINT32_MAX)
@@ -1610,12 +1641,13 @@ static VAStatus encode_picture(struct v4l2r_context *ctx)
 			   "ending CPU access to imported surface 0x%08x failed",
 			   surface->id);
 	if (status < 0) {
-		rollback_coded(enc, coded, coded_id);
-		surface->encode_pending = false;
 		v4l2r_diag(ctx, V4L2R_DIAG_LEVEL_ERROR,
 			   v4l2r_diag_errno_category(status), "encode-submit",
 			   status, "frame submission failed at %s",
 			   ave_encoder_last_operation(enc->encoder));
+		/* submit can fail after QBUF (STREAMON). Stop and cancel all
+		 * outstanding work instead of forgetting a live hardware tag. */
+		cancel_encoder(ctx);
 		return status_from_errno(status);
 	}
 
@@ -1786,6 +1818,8 @@ static VAStatus wait_delivery(struct v4l2r_driver *drv, VABufferID id,
 		ctx = buffer ? find_encode_context(drv, buffer->context_id) : NULL;
 		if (!buffer || !ctx)
 			return VA_STATUS_ERROR_INVALID_BUFFER;
+		if (!buffer->coded->tag || !buffer->coded->ready)
+			return VA_STATUS_ERROR_INVALID_BUFFER;
 		if (buffer->coded->delivered)
 			break;
 	}
@@ -1826,9 +1860,14 @@ VAStatus v4l2r_encode_destroy_coded(struct v4l2r_driver *drv,
 {
 	VAStatus status = VA_STATUS_SUCCESS;
 
-	if (buffer->coded->tag && !buffer->coded->ready &&
-	    find_encode_context(drv, buffer->context_id))
+	struct v4l2r_context *ctx = find_encode_context(drv, buffer->context_id);
+
+	if (buffer->coded->tag && ctx) {
 		status = sync_coded(drv, buffer, AVE_MAP_TIMEOUT_MS);
+		if (status == VA_STATUS_SUCCESS && !buffer->coded->input_done)
+			status = pump_until(ctx->enc, &buffer->coded->input_done,
+					    AVE_MAP_TIMEOUT_MS);
+	}
 	if (status != VA_STATUS_SUCCESS)
 		return status;
 

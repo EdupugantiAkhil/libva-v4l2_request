@@ -412,7 +412,7 @@ if have_ave_encode
                 '-Wl,--wrap=munmap', '-Wl,--wrap=open64', '-Wl,--wrap=__open_2',
                 '-Wl,--wrap=__open64_2', '-Wl,--wrap=mmap64'])
   foreach case : ['units', 'capabilities', 'decode-isolation', 'chrome', 'ffmpeg',
-                  'import', 'lifetime', 'completion']
+                  'import', 'lifetime', 'completion', 'faults']
     test('ave-encode-' + case, ave_encode, args: [case], timeout: 30)
   endforeach
 endif

@@ -73,6 +73,14 @@ static struct {
 
 /* DMA_BUF_IOCTL_SYNC calls on real descriptors (memfds stand in). */
 static unsigned int dmabuf_syncs;
+static bool fail_sync_end;
+static bool fail_capture_streamon;
+static bool capture_before_output;
+static bool capture_delivered;
+static unsigned int requested_fps = 30;
+static unsigned int requested_max_qp = 42;
+static bool omit_rate_misc;
+static bool requested_hevc_tiles;
 
 static int avd_ioctl(unsigned long request, void *arg)
 {
@@ -347,9 +355,15 @@ static int ave_ioctl(unsigned long request, void *arg)
 		unsigned int n = output ? ave.nout : ave.ncap;
 
 		fake_process();
+		if (output && capture_before_output && !capture_delivered) {
+			errno = EAGAIN;
+			return -1;
+		}
 		for (unsigned int i = 0; i < n; i++) {
 			if (bufs[i].queued && bufs[i].done) {
 				bufs[i].queued = false;
+				if (!output)
+					capture_delivered = true;
 				b->index = i;
 				b->timestamp = bufs[i].timestamp;
 				b->flags = output ? 0 : bufs[i].flags;
@@ -363,6 +377,12 @@ static int ave_ioctl(unsigned long request, void *arg)
 	case VIDIOC_STREAMON: {
 		enum v4l2_buf_type *type = arg;
 
+		if (*type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE &&
+		    fail_capture_streamon) {
+			fail_capture_streamon = false;
+			errno = EIO;
+			return -1;
+		}
 		if (*type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE)
 			ave.out_on = true;
 		else
@@ -485,6 +505,12 @@ int __wrap_ioctl(int fd, unsigned long request, ...)
 	/* memfds stand in for DMA-BUFs: accept the CPU access brackets. */
 	if (request == DMA_BUF_IOCTL_SYNC) {
 		dmabuf_syncs++;
+		if (fail_sync_end &&
+		    (((struct dma_buf_sync *)arg)->flags & DMA_BUF_SYNC_END)) {
+			fail_sync_end = false;
+			errno = EIO;
+			return -1;
+		}
 		return 0;
 	}
 	return __real_ioctl(fd, request, arg);
@@ -1402,9 +1428,9 @@ static VAStatus submit_h264(VAContextID context, VASurfaceID surface,
 	rate.bits_per_second = 2000000;
 	rate.target_percentage = 100;
 	rate.min_qp = 1;
-	rate.max_qp = 42;
+	rate.max_qp = requested_max_qp;
 	rate.rc_flags.bits.disable_frame_skip = 1;
-	frame_rate.framerate = 30;
+	frame_rate.framerate = requested_fps;
 	hrd.buffer_size = 3000000;
 
 	buffers[count++] = make_buffer(context, VAEncSequenceParameterBufferType,
@@ -1414,8 +1440,9 @@ static VAStatus submit_h264(VAContextID context, VASurfaceID surface,
 	for (int i = 0; i < slices; i++)
 		buffers[count++] = make_buffer(context, VAEncSliceParameterBufferType,
 					       sizeof(slice), &slice);
-	buffers[count++] = make_misc(context, VAEncMiscParameterTypeRateControl,
-				     &rate, sizeof(rate));
+	if (!omit_rate_misc)
+		buffers[count++] = make_misc(context, VAEncMiscParameterTypeRateControl,
+					     &rate, sizeof(rate));
 	buffers[count++] = make_misc(context, VAEncMiscParameterTypeFrameRate,
 				     &frame_rate, sizeof(frame_rate));
 	buffers[count++] = make_misc(context, VAEncMiscParameterTypeHRD, &hrd,
@@ -1585,6 +1612,7 @@ static VAStatus submit_hevc(VAContextID context, VASurfaceID surface,
 	sequence.log2_diff_max_min_luma_coding_block_size = 2;	/* CTU 32 */
 	picture.coded_buf = coded;
 	picture.pic_fields.bits.idr_pic_flag = idr;
+	picture.pic_fields.bits.tiles_enabled_flag = requested_hevc_tiles;
 	picture.pic_init_qp = 30;
 	slice.num_ctu_in_slice = 60 * 34;
 	slice.slice_type = idr ? 2 : 1;
@@ -1996,6 +2024,7 @@ static void case_import(void)
 	close(fd);
 	coded = make_buffer(context, VAEncCodedBufferType, 1 << 20, NULL);
 	dmabuf_syncs = 0;
+	fail_sync_end = true;	/* END fails after QBUF: frame must survive. */
 	CHECK(submit_h264(context, surface, coded, false, 2, 1, true) ==
 	      VA_STATUS_SUCCESS);
 	/* Read bracketed by DMA_BUF_SYNC start and end. */
@@ -2205,6 +2234,110 @@ static void case_completion(void)
 	teardown();
 }
 
+/* Completion/failure schedules not covered by the eager device model. */
+static void case_faults(void)
+{
+	VAConfigAttrib attr = { VAConfigAttribRateControl, VA_RC_CBR };
+	VAConfigID config;
+	VAContextID context;
+	VASurfaceID surfaces[2];
+	VABufferID coded;
+	VACodedBufferSegment *segment = NULL;
+
+	setup(FAKE_AVE_PATH);
+	CHECK(vtable.vaCreateConfig(&driver, VAProfileH264High, VAEntrypointEncSlice,
+				    &attr, 1, &config) == VA_STATUS_SUCCESS);
+	CHECK(vtable.vaCreateContext(&driver, config, 1280, 720, VA_PROGRESSIVE,
+				     NULL, 0, &context) == VA_STATUS_SUCCESS);
+	CHECK(vtable.vaCreateSurfaces2(&driver, VA_RT_FORMAT_YUV420, 1280, 720,
+				       surfaces, 2, NULL, 0) == VA_STATUS_SUCCESS);
+	coded = make_buffer(context, VAEncCodedBufferType, 1 << 20, NULL);
+	lazy = true;
+	CHECK(submit_h264(context, surfaces[0], coded, false, 2, 1, true) ==
+	      VA_STATUS_SUCCESS);
+	/* Reusing an in-flight coded buffer must not clobber its tag. */
+	CHECK(submit_h264(context, surfaces[1], coded, false, 0, 1, false) ==
+	      VA_STATUS_ERROR_HW_BUSY);
+	CHECK(V4L2R_SURFACE(drv, surfaces[0])->encode_pending);
+	CHECK(!V4L2R_SURFACE(drv, surfaces[1])->encode_pending);
+	capture_before_output = true;
+	capture_delivered = false;
+	CHECK(vtable.vaMapBuffer(&driver, coded, (void **)&segment) ==
+	      VA_STATUS_SUCCESS);
+	CHECK(segment && segment->size == 7);
+	CHECK(vtable.vaUnmapBuffer(&driver, coded) == VA_STATUS_SUCCESS);
+	/* CAPTURE is ready, but the first OUTPUT sweep saw EAGAIN. Destroy
+	 * must service that OUTPUT completion before removing the VA buffer. */
+	CHECK(V4L2R_SURFACE(drv, surfaces[0])->encode_pending);
+	CHECK(vtable.vaDestroyBuffer(&driver, coded) == VA_STATUS_SUCCESS);
+	CHECK(!V4L2R_SURFACE(drv, surfaces[0])->encode_pending);
+	capture_before_output = false;
+	coded = make_buffer(context, VAEncCodedBufferType, 1 << 20, NULL);
+	CHECK(submit_h264(context, surfaces[1], coded, false, 0, 1, false) ==
+	      VA_STATUS_SUCCESS);
+	CHECK(vtable.vaSyncSurface(&driver, surfaces[1]) == VA_STATUS_SUCCESS);
+	/* Changed QP limits and frame rate are not silently accepted. */
+	requested_max_qp = 40;
+	CHECK(submit_h264(context, surfaces[0], coded, false, 0, 1, false) ==
+	      VA_STATUS_ERROR_UNIMPLEMENTED);
+	requested_max_qp = 42;
+	omit_rate_misc = true;	/* frame-rate-only request */
+	requested_fps = 60;
+	CHECK(submit_h264(context, surfaces[0], coded, false, 0, 1, false) ==
+	      VA_STATUS_ERROR_UNIMPLEMENTED);
+	requested_fps = 30;
+	CHECK(submit_h264(context, surfaces[0], coded, false, 0, 1, false) ==
+	      VA_STATUS_SUCCESS);
+	omit_rate_misc = false;
+	CHECK(vtable.vaDestroyBuffer(&driver, coded) == VA_STATUS_SUCCESS);
+	CHECK(vtable.vaDestroyContext(&driver, context) == VA_STATUS_SUCCESS);
+
+	CHECK(vtable.vaCreateContext(&driver, config, 1280, 720, VA_PROGRESSIVE,
+				     NULL, 0, &context) == VA_STATUS_SUCCESS);
+	coded = make_buffer(context, VAEncCodedBufferType, 1 << 20, NULL);
+	/* STREAMON(CAPTURE) fails after OUTPUT QBUF; the entire session is
+	 * cancelled, not reused with a queued buffer whose tag was forgotten. */
+	fail_capture_streamon = true;
+	CHECK(submit_h264(context, surfaces[0], coded, false, 2, 1, true) ==
+	      VA_STATUS_ERROR_ENCODING_ERROR);
+	CHECK(!ave.open && !V4L2R_SURFACE(drv, surfaces[0])->encode_pending);
+	CHECK(submit_h264(context, surfaces[1], coded, false, 0, 1, false) ==
+	      VA_STATUS_ERROR_ENCODING_ERROR);
+	CHECK(vtable.vaDestroyBuffer(&driver, coded) == VA_STATUS_SUCCESS);
+	CHECK(vtable.vaDestroyContext(&driver, context) == VA_STATUS_SUCCESS);
+	CHECK(vtable.vaDestroySurfaces(&driver, surfaces, 2) == VA_STATUS_SUCCESS);
+	CHECK(vtable.vaDestroyConfig(&driver, config) == VA_STATUS_SUCCESS);
+	lazy = false;
+	teardown();
+
+	/* A later HEVC picture/sequence must pass the same safety checks as
+	 * the first, even when the encoder is already open. */
+	setup(FAKE_AVE_PATH);
+	CHECK(vtable.vaCreateConfig(&driver, VAProfileHEVCMain, VAEntrypointEncSlice,
+				    &attr, 1, &config) == VA_STATUS_SUCCESS);
+	CHECK(vtable.vaCreateContext(&driver, config, 1920, 1088, VA_PROGRESSIVE,
+				     NULL, 0, &context) == VA_STATUS_SUCCESS);
+	CHECK(vtable.vaCreateSurfaces2(&driver, VA_RT_FORMAT_YUV420, 1920, 1080,
+				       surfaces, 1, NULL, 0) == VA_STATUS_SUCCESS);
+	coded = make_buffer(context, VAEncCodedBufferType, 1 << 20, NULL);
+	CHECK(submit_hevc(context, surfaces[0], coded, false, false, 0) ==
+	      VA_STATUS_SUCCESS);
+	CHECK(vtable.vaSyncSurface(&driver, surfaces[0]) == VA_STATUS_SUCCESS);
+	CHECK(submit_hevc(context, surfaces[0], coded, true, false, 0) ==
+	      VA_STATUS_ERROR_UNIMPLEMENTED);
+	requested_hevc_tiles = true;
+	CHECK(submit_hevc(context, surfaces[0], coded, false, false, 1) ==
+	      VA_STATUS_ERROR_UNIMPLEMENTED);
+	requested_hevc_tiles = false;
+	CHECK(submit_hevc(context, surfaces[0], coded, false, false, 1) ==
+	      VA_STATUS_SUCCESS);
+	CHECK(vtable.vaDestroyBuffer(&driver, coded) == VA_STATUS_SUCCESS);
+	CHECK(vtable.vaDestroyContext(&driver, context) == VA_STATUS_SUCCESS);
+	CHECK(vtable.vaDestroySurfaces(&driver, surfaces, 1) == VA_STATUS_SUCCESS);
+	CHECK(vtable.vaDestroyConfig(&driver, config) == VA_STATUS_SUCCESS);
+	teardown();
+}
+
 int main(int argc, char **argv)
 {
 	const char *name = argc > 1 ? argv[1] : "";
@@ -2225,6 +2358,8 @@ int main(int argc, char **argv)
 		case_lifetime();
 	else if (!strcmp(name, "completion"))
 		case_completion();
+	else if (!strcmp(name, "faults"))
+		case_faults();
 	else {
 		fprintf(stderr, "unknown case '%s'\n", name);
 		return 2;
