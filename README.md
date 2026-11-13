@@ -282,6 +282,14 @@ The offset is visible in FFmpeg's [PPS parser](https://github.com/FFmpeg/FFmpeg/
 and [VA parameter construction](https://github.com/FFmpeg/FFmpeg/blob/n8.0/libavcodec/vaapi_h264.c).
 This is a client compatibility setting, not a change to the VA-API or V4L2 parameter contract.
 
+### AVE encoding
+
+When the kernel exposes an `apple-ave` video node, the same driver also offers
+H.264 and HEVC (Main, Main 10) `VAEntrypointEncSlice` encoding, so no separate
+encoder driver or dispatcher is needed. `-Dave_encode=disabled` builds the
+decode-only driver; `LIBVA_V4L2_ENCODE=0` turns encoding off at run time. See
+[docs/AVE_ENCODE.md](docs/AVE_ENCODE.md).
+
 ### Diagnostics
 
 Driver messages go to standard error as `libva-v4l2request: ...` lines. Set
