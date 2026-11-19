@@ -2140,6 +2140,13 @@ static void case_lifetime(void)
 	CHECK(vtable.vaCreateContext(&driver, config, 1280, 720, VA_PROGRESSIVE,
 				     NULL, 0, &context) == VA_STATUS_SUCCESS);
 	coded[0] = make_buffer(context, VAEncCodedBufferType, 1 << 20, NULL);
+	/* The input of an open encode picture cannot be destroyed: vaEndPicture
+	 * looks it up again by ID, which a new surface could reuse. */
+	CHECK(vtable.vaBeginPicture(&driver, context, surface) == VA_STATUS_SUCCESS);
+	CHECK(vtable.vaDestroySurfaces(&driver, &surface, 1) ==
+	      VA_STATUS_ERROR_SURFACE_BUSY);
+	CHECK(vtable.vaEndPicture(&driver, context) != VA_STATUS_SUCCESS);
+	CHECK(V4L2R_SURFACE(drv, surface) != NULL);
 	lazy = true;
 	CHECK(submit_h264(context, surface, coded[0], false, 2, 1, true) ==
 	      VA_STATUS_SUCCESS);

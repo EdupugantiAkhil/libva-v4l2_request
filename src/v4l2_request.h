@@ -949,6 +949,10 @@ VAStatus v4l2r_encode_sync_surface(struct v4l2r_driver *drv,
 void v4l2r_encode_query_surface(struct v4l2r_driver *drv,
 				struct v4l2r_surface *surface,
 				VASurfaceStatus *status);
+/* True while @ctx has an open encode picture (vaBeginPicture without its
+ * vaEndPicture yet) whose input is @surface (drv->mutex held). */
+bool v4l2r_encode_holds_input(const struct v4l2r_context *ctx,
+			      VASurfaceID surface);
 /* Coded buffers: state allocated at creation. map_coded takes api_mutex;
  * destroy_coded expects the caller to hold it. */
 VAStatus v4l2r_encode_buffer_init(struct v4l2r_buffer *buffer);
@@ -1065,6 +1069,13 @@ static inline void v4l2r_encode_query_surface(struct v4l2r_driver *drv,
 {
 	(void)drv; (void)surface;
 	*status = VASurfaceReady;
+}
+
+static inline bool v4l2r_encode_holds_input(const struct v4l2r_context *ctx,
+					    VASurfaceID surface)
+{
+	(void)ctx; (void)surface;
+	return false;
 }
 
 static inline VAStatus v4l2r_encode_buffer_init(struct v4l2r_buffer *buffer)

@@ -1729,6 +1729,12 @@ static VAStatus sync_surface_timeout(struct v4l2r_driver *drv,
 	return VA_STATUS_SUCCESS;
 }
 
+bool v4l2r_encode_holds_input(const struct v4l2r_context *ctx,
+			      VASurfaceID surface)
+{
+	return ctx->enc && ctx->in_picture && ctx->enc->target == surface;
+}
+
 VAStatus v4l2r_encode_sync_surface(struct v4l2r_driver *drv,
 				   struct v4l2r_surface *surface)
 {

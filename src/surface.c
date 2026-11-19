@@ -159,6 +159,13 @@ VAStatus v4l2r_DestroySurfaces(VADriverContextP va_ctx, VASurfaceID *surface_lis
 				vpp_busy = true;
 				break;
 			}
+			/* An open encode picture looks its input up again by ID
+			 * at vaEndPicture; a freed ID could name another surface
+			 * by then. */
+			if (v4l2r_encode_holds_input(ctx, surface_list[i])) {
+				vpp_busy = true;
+				break;
+			}
 		}
 		pthread_mutex_unlock(&drv->mutex);
 		if (!surface)
