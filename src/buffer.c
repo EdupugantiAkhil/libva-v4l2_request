@@ -23,6 +23,7 @@ VAStatus v4l2r_CreateBuffer(VADriverContextP va_ctx, VAContextID context_id,
 {
 	V4L2R_OVERLAP_UNLOCKED();
 	struct v4l2r_driver *drv = v4l2r_driver(va_ctx);
+	struct v4l2r_buffer prepared = {0};
 	struct v4l2r_buffer *buffer;
 	struct v4l2r_context *ctx;
 	bool decode_type = true;
@@ -51,46 +52,59 @@ VAStatus v4l2r_CreateBuffer(VADriverContextP va_ctx, VAContextID context_id,
 		break;
 	}
 
+	/* Refuse a buffer the context cannot take before allocating it; the
+	 * check is repeated when the buffer is published. */
 	pthread_mutex_lock(&drv->mutex);
 	ctx = V4L2R_CONTEXT(drv, context_id);
-	if (!decode_type && (!ctx || !ctx->enc)) {
-		pthread_mutex_unlock(&drv->mutex);
-		return VA_STATUS_ERROR_UNSUPPORTED_BUFFERTYPE;
-	}
-	/* Image storage is allocated internally, independently of a context. */
-	if (type != VAImageBufferType && !ctx) {
-		pthread_mutex_unlock(&drv->mutex);
-		return VA_STATUS_ERROR_INVALID_CONTEXT;
-	}
-	id = v4l2r_handles_alloc(&drv->buffers, sizeof(*buffer));
-	buffer = V4L2R_BUFFER(drv, id);
-	if (buffer)
-		buffer->context_id = type == VAImageBufferType ? VA_INVALID_ID : context_id;
+	if (!decode_type && (!ctx || !ctx->enc))
+		status = VA_STATUS_ERROR_UNSUPPORTED_BUFFERTYPE;
+	else if (type != VAImageBufferType && !ctx)
+		status = VA_STATUS_ERROR_INVALID_CONTEXT;
+	else
+		status = VA_STATUS_SUCCESS;
 	pthread_mutex_unlock(&drv->mutex);
-	if (!buffer)
-		return VA_STATUS_ERROR_ALLOCATION_FAILED;
+	if (status != VA_STATUS_SUCCESS)
+		return status;
 
-	buffer->type = type;
-	buffer->element_size = size;
-	buffer->nb_elements = num_elements;
-
-	buffer->data = malloc((size_t)size * num_elements);
-	if (!buffer->data) {
-		pthread_mutex_lock(&drv->mutex);
-		v4l2r_handles_free(&drv->buffers, id);
-		pthread_mutex_unlock(&drv->mutex);
+	/* Build the whole buffer first and publish it in one step: encode.c
+	 * scans the buffer handles for coded buffers from its completion
+	 * path, under drv->mutex. */
+	prepared.type = type;
+	prepared.element_size = size;
+	prepared.nb_elements = num_elements;
+	prepared.data = malloc((size_t)size * num_elements);
+	if (!prepared.data)
 		return VA_STATUS_ERROR_ALLOCATION_FAILED;
+	if (data)
+		memcpy(prepared.data, data, (size_t)size * num_elements);
+	status = v4l2r_encode_buffer_init(&prepared);
+	if (status != VA_STATUS_SUCCESS) {
+		free(prepared.data);
+		return status;
 	}
 
-	if (data)
-		memcpy(buffer->data, data, (size_t)size * num_elements);
-
-	status = v4l2r_encode_buffer_init(buffer);
+	pthread_mutex_lock(&drv->mutex);
+	ctx = V4L2R_CONTEXT(drv, context_id);
+	if (!decode_type && (!ctx || !ctx->enc))
+		status = VA_STATUS_ERROR_UNSUPPORTED_BUFFERTYPE;
+	/* Image storage is allocated internally, independently of a context. */
+	else if (type != VAImageBufferType && !ctx)
+		status = VA_STATUS_ERROR_INVALID_CONTEXT;
+	else {
+		id = v4l2r_handles_alloc(&drv->buffers, sizeof(*buffer));
+		buffer = V4L2R_BUFFER(drv, id);
+		if (buffer) {
+			*buffer = prepared;
+			buffer->context_id = type == VAImageBufferType ?
+					     VA_INVALID_ID : context_id;
+		} else {
+			status = VA_STATUS_ERROR_ALLOCATION_FAILED;
+		}
+	}
+	pthread_mutex_unlock(&drv->mutex);
 	if (status != VA_STATUS_SUCCESS) {
-		free(buffer->data);
-		pthread_mutex_lock(&drv->mutex);
-		v4l2r_handles_free(&drv->buffers, id);
-		pthread_mutex_unlock(&drv->mutex);
+		free(prepared.coded);
+		free(prepared.data);
 		return status;
 	}
 
