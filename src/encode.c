@@ -151,6 +151,8 @@ struct v4l2r_encode {
 	size_t queue_count;
 
 	uint32_t frames_per_second;
+	uint32_t gop_size;		/* as opened; AVE reads it at STREAMON */
+	uint32_t opened_vui_fps;	/* VUI frame rate the session opened with */
 	uint64_t sequence;		/* pictures submitted */
 	uint32_t bitrate;
 	/* Fixed once the session is open: AVE takes only a new average bit
@@ -1194,6 +1196,53 @@ static uint32_t frame_rate_or_default(const struct ave_rate_request *rate,
 	return AVE_DEFAULT_FPS;
 }
 
+/* Frame rate from the sequence's VUI timing, or 0 when it has none. */
+static uint32_t h264_vui_fps(const VAEncSequenceParameterBufferH264 *sequence)
+{
+	uint64_t derived;
+
+	if (!sequence->vui_parameters_present_flag ||
+	    !sequence->vui_fields.bits.timing_info_present_flag ||
+	    !sequence->num_units_in_tick)
+		return 0;
+	derived = sequence->time_scale /
+		  ((uint64_t)sequence->num_units_in_tick * 2u);
+	return derived > 0 && derived <= 240 ? (uint32_t)derived : 0;
+}
+
+static uint32_t hevc_vui_fps(const VAEncSequenceParameterBufferHEVC *sequence)
+{
+	uint32_t derived;
+
+	if (!sequence->vui_parameters_present_flag ||
+	    !sequence->vui_fields.bits.vui_timing_info_present_flag ||
+	    !sequence->vui_num_units_in_tick || !sequence->vui_time_scale)
+		return 0;
+	derived = sequence->vui_time_scale / sequence->vui_num_units_in_tick;
+	return derived > 0 && derived <= 240 ? derived : 0;
+}
+
+/*
+ * A later sequence in the same session: AVE reads the GOP and frame rate
+ * once, at STREAMON, so a different value cannot take effect. Refuse it
+ * rather than encode with the old one. The VUI frame rate only counts when
+ * the picture has no frame-rate parameter (update_rate checks that one), and
+ * only when the client changed it: the VUI rate the session opened with may
+ * differ from the session's rate (a fractional rate is rounded in one and
+ * truncated in the other), and resending it unchanged must pass.
+ */
+static int check_sequence_timing(const struct v4l2r_encode *enc,
+				 uint32_t gop_size, uint32_t vui_fps)
+{
+	if (gop_size != enc->gop_size)
+		return -ENOTSUP;
+	if (!enc->pic.rate.frame_rate_seen && vui_fps &&
+	    vui_fps != enc->opened_vui_fps &&
+	    vui_fps != enc->frames_per_second)
+		return -ENOTSUP;
+	return 0;
+}
+
 static int open_encoder(struct v4l2r_encode *enc,
 			struct ave_encoder_config *config,
 			const struct ave_rate_settings *rate,
@@ -1234,6 +1283,7 @@ static int open_encoder(struct v4l2r_encode *enc,
 	enc->encode_width = encode_width;
 	enc->encode_height = encode_height;
 	enc->frames_per_second = config->frames_per_second;
+	enc->gop_size = config->gop_size;
 	enc->bitrate = rate->bitrate;
 	enc->opened_rate = *rate;
 	return 0;
@@ -1279,14 +1329,7 @@ static int open_h264(struct v4l2r_encode *enc)
 					   sequence->bits_per_second, &rate);
 	if (status < 0)
 		return status;
-	if (sequence->vui_fields.bits.timing_info_present_flag &&
-	    sequence->num_units_in_tick > 0) {
-		uint64_t derived = sequence->time_scale /
-				   ((uint64_t)sequence->num_units_in_tick * 2u);
-
-		if (derived > 0 && derived <= 240)
-			vui_fps = (uint32_t)derived;
-	}
+	vui_fps = h264_vui_fps(sequence);
 
 	config.coded_format = V4L2_PIX_FMT_H264;
 	config.raw_format = V4L2_PIX_FMT_NV12;
@@ -1295,7 +1338,10 @@ static int open_h264(struct v4l2r_encode *enc)
 					  sequence->intra_period);
 	config.h264_profile = profile;
 	config.h264_level = level;
-	return open_encoder(enc, &config, &rate, width, height);
+	status = open_encoder(enc, &config, &rate, width, height);
+	if (status == 0)
+		enc->opened_vui_fps = vui_fps;
+	return status;
 }
 
 static int open_hevc(struct v4l2r_encode *enc, const struct v4l2r_surface *input)
@@ -1373,8 +1419,7 @@ static int open_hevc(struct v4l2r_encode *enc, const struct v4l2r_surface *input
 					   sequence->bits_per_second, &rate);
 	if (status < 0)
 		return status;
-	if (sequence->vui_num_units_in_tick && sequence->vui_time_scale)
-		vui_fps = sequence->vui_time_scale / sequence->vui_num_units_in_tick;
+	vui_fps = hevc_vui_fps(sequence);
 
 	enc->opened_hevc = *sequence;
 	enc->hevc_ctu_count = ctu_count;
@@ -1392,7 +1437,10 @@ static int open_hevc(struct v4l2r_encode *enc, const struct v4l2r_surface *input
 	config.hevc_profile = main10 ? V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN_10 :
 				       V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN;
 	config.hevc_level = level;
-	return open_encoder(enc, &config, &rate, width, height);
+	status = open_encoder(enc, &config, &rate, width, height);
+	if (status == 0)
+		enc->opened_vui_fps = vui_fps;
+	return status;
 }
 
 /*
@@ -1539,6 +1587,14 @@ static VAStatus encode_picture(struct v4l2r_context *ctx)
 		    (sequence->pic_width_in_luma_samples != enc->width ||
 		     sequence->pic_height_in_luma_samples != enc->height))
 			return VA_STATUS_ERROR_INVALID_PARAMETER;
+		if (sequence) {
+			status = check_sequence_timing(
+				enc, ave_gop_from_va(sequence->intra_idr_period,
+						     sequence->intra_period),
+				hevc_vui_fps(sequence));
+			if (status < 0)
+				return status_from_errno(status);
+		}
 		status = update_rate(enc, sequence ? sequence->bits_per_second : 0);
 		if (status < 0)
 			return status_from_errno(status);
@@ -1554,6 +1610,12 @@ static VAStatus encode_picture(struct v4l2r_context *ctx)
 			if (status < 0 || width != enc->encode_width ||
 			    height != enc->encode_height)
 				return VA_STATUS_ERROR_INVALID_PARAMETER;
+			status = check_sequence_timing(
+				enc, ave_gop_from_va(sequence->intra_idr_period,
+						     sequence->intra_period),
+				h264_vui_fps(sequence));
+			if (status < 0)
+				return status_from_errno(status);
 		}
 		status = update_rate(enc, sequence ? sequence->bits_per_second : 0);
 		if (status < 0)

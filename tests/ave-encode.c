@@ -80,6 +80,10 @@ static bool capture_delivered;
 static unsigned int requested_fps = 30;
 static unsigned int requested_max_qp = 42;
 static bool omit_rate_misc;
+static bool omit_frame_rate_misc;
+static unsigned int requested_idr_period = 2048;
+static unsigned int requested_vui_fps;	/* 0: no VUI timing */
+static bool vui_timing_off;	/* VUI fields set, vui_parameters_present_flag clear */
 static bool requested_hevc_tiles;
 
 static int avd_ioctl(unsigned long request, void *arg)
@@ -1411,9 +1415,19 @@ static VAStatus submit_h264(VAContextID context, VASurfaceID surface,
 
 	sequence.level_idc = 31;
 	sequence.intra_period = 0;
-	sequence.intra_idr_period = 2048;
+	sequence.intra_idr_period = requested_idr_period;
 	sequence.ip_period = 1;
 	sequence.bits_per_second = 2000000;
+	if (requested_vui_fps) {
+		sequence.vui_parameters_present_flag = 1;
+		sequence.vui_fields.bits.timing_info_present_flag = 1;
+		sequence.num_units_in_tick = 1;
+		sequence.time_scale = 2 * requested_vui_fps;
+		/* The VUI as a whole switched off; its timing fields and inner
+		 * flag left behind must not count. */
+		if (vui_timing_off)
+			sequence.vui_parameters_present_flag = 0;
+	}
 	sequence.picture_width_in_mbs = 80;
 	sequence.picture_height_in_mbs = 45;
 	sequence.seq_fields.bits.chroma_format_idc = 1;
@@ -1443,8 +1457,9 @@ static VAStatus submit_h264(VAContextID context, VASurfaceID surface,
 	if (!omit_rate_misc)
 		buffers[count++] = make_misc(context, VAEncMiscParameterTypeRateControl,
 					     &rate, sizeof(rate));
-	buffers[count++] = make_misc(context, VAEncMiscParameterTypeFrameRate,
-				     &frame_rate, sizeof(frame_rate));
+	if (!omit_frame_rate_misc)
+		buffers[count++] = make_misc(context, VAEncMiscParameterTypeFrameRate,
+					     &frame_rate, sizeof(frame_rate));
 	buffers[count++] = make_misc(context, VAEncMiscParameterTypeHRD, &hrd,
 				     sizeof(hrd));
 	if (packed) {
@@ -2296,6 +2311,53 @@ static void case_faults(void)
 	CHECK(submit_h264(context, surfaces[0], coded, false, 0, 1, false) ==
 	      VA_STATUS_SUCCESS);
 	omit_rate_misc = false;
+	/* Nor a changed GOP: AVE reads it once, at STREAMON. */
+	requested_idr_period = 60;
+	CHECK(submit_h264(context, surfaces[0], coded, false, 0, 1, true) ==
+	      VA_STATUS_ERROR_UNIMPLEMENTED);
+	requested_idr_period = 2048;
+	/* Nor a changed VUI frame rate when no frame-rate parameter comes with
+	 * it; the session's own rate is accepted. */
+	omit_frame_rate_misc = true;
+	requested_vui_fps = 60;
+	CHECK(submit_h264(context, surfaces[0], coded, false, 0, 1, true) ==
+	      VA_STATUS_ERROR_UNIMPLEMENTED);
+	requested_vui_fps = 30;
+	CHECK(submit_h264(context, surfaces[0], coded, false, 0, 1, true) ==
+	      VA_STATUS_SUCCESS);
+	requested_vui_fps = 0;
+	omit_frame_rate_misc = false;
+	CHECK(vtable.vaSyncSurface(&driver, surfaces[0]) == VA_STATUS_SUCCESS);
+	CHECK(vtable.vaDestroyBuffer(&driver, coded) == VA_STATUS_SUCCESS);
+	CHECK(vtable.vaDestroyContext(&driver, context) == VA_STATUS_SUCCESS);
+
+	/* A session opened with a frame-rate parameter and a VUI rate that
+	 * disagree (30 vs 29: 30000/1001 rounds one way and truncates the
+	 * other). Resending the same sequence without the parameter passes;
+	 * a VUI rate the client really changed does not. */
+	CHECK(vtable.vaCreateContext(&driver, config, 1280, 720, VA_PROGRESSIVE,
+				     NULL, 0, &context) == VA_STATUS_SUCCESS);
+	coded = make_buffer(context, VAEncCodedBufferType, 1 << 20, NULL);
+	requested_vui_fps = 29;
+	CHECK(submit_h264(context, surfaces[0], coded, false, 2, 1, true) ==
+	      VA_STATUS_SUCCESS);
+	CHECK(vtable.vaSyncSurface(&driver, surfaces[0]) == VA_STATUS_SUCCESS);
+	omit_frame_rate_misc = true;
+	CHECK(submit_h264(context, surfaces[0], coded, false, 2, 1, true) ==
+	      VA_STATUS_SUCCESS);
+	CHECK(vtable.vaSyncSurface(&driver, surfaces[0]) == VA_STATUS_SUCCESS);
+	requested_vui_fps = 60;
+	CHECK(submit_h264(context, surfaces[0], coded, false, 2, 1, true) ==
+	      VA_STATUS_ERROR_UNIMPLEMENTED);
+	/* VUI timing the client switched off is no frame rate at all, whatever
+	 * stale numbers it leaves in the buffer. */
+	vui_timing_off = true;
+	CHECK(submit_h264(context, surfaces[0], coded, false, 2, 1, true) ==
+	      VA_STATUS_SUCCESS);
+	CHECK(vtable.vaSyncSurface(&driver, surfaces[0]) == VA_STATUS_SUCCESS);
+	vui_timing_off = false;
+	requested_vui_fps = 0;
+	omit_frame_rate_misc = false;
 	CHECK(vtable.vaDestroyBuffer(&driver, coded) == VA_STATUS_SUCCESS);
 	CHECK(vtable.vaDestroyContext(&driver, context) == VA_STATUS_SUCCESS);
 
