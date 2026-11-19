@@ -1555,6 +1555,15 @@ static VAStatus encode_picture(struct v4l2r_context *ctx)
 		return VA_STATUS_ERROR_INVALID_BUFFER;
 	if (!surface)
 		return VA_STATUS_ERROR_INVALID_SURFACE;
+	/* vaBeginPicture finished any encode of this input, but another
+	 * context may have submitted it since. Finish that one too before this
+	 * encode replaces the surface's completion record. */
+	if (surface->encode_pending) {
+		VAStatus sync_status = v4l2r_encode_sync_surface(drv, surface);
+
+		if (sync_status != VA_STATUS_SUCCESS)
+			return sync_status;
+	}
 	/* Do not reset a buffer still owned by the previous submission. In
 	 * particular EALREADY from queue_coded must never orphan its tag. */
 	if (coded->coded->tag && !coded->coded->ready)
