@@ -1226,7 +1226,7 @@ static uint32_t hevc_vui_fps(const VAEncSequenceParameterBufferHEVC *sequence)
  * A later sequence in the same session: AVE reads the GOP and frame rate
  * once, at STREAMON, so a different value cannot take effect. Refuse it
  * rather than encode with the old one. The VUI frame rate only counts when
- * the picture has no frame-rate parameter (update_rate checks that one), and
+ * the picture has no frame-rate parameter (check_rate checks that one), and
  * only when the client changed it: the VUI rate the session opened with may
  * differ from the session's rate (a fractional rate is rounded in one and
  * truncated in the other), and resending it unchanged must pass.
@@ -1447,12 +1447,16 @@ static int open_hevc(struct v4l2r_encode *enc, const struct v4l2r_surface *input
  * Rate changes after the session started: apple-ave applies a new average
  * bit rate at the next frame (ave_build_process). Mode, peak, frame rate
  * and QP range are read once at STREAMON and cannot change mid-stream.
+ * Only checks the request and returns the bit rate to use; vaEndPicture
+ * sets it once the picture is accepted.
  */
-static int update_rate(struct v4l2r_encode *enc,
-		       uint32_t sequence_bits_per_second)
+static int check_rate(const struct v4l2r_encode *enc,
+		      uint32_t sequence_bits_per_second, uint32_t *bitrate)
 {
 	struct ave_rate_settings rate;
 	int status;
+
+	*bitrate = enc->bitrate;
 
 	/* Check frame-rate-only requests too, before the rate-control fast
 	 * path. Repeating the original value is harmless. */
@@ -1472,12 +1476,7 @@ static int update_rate(struct v4l2r_encode *enc,
 	      rate.min_qp != enc->opened_rate.min_qp ||
 	      rate.max_qp != enc->opened_rate.max_qp)))
 		return -ENOTSUP;
-	if (rate.bitrate == enc->bitrate)
-		return 0;
-	status = ave_encoder_set_bitrate(enc->encoder, rate.bitrate);
-	if (status < 0)
-		return status;
-	enc->bitrate = rate.bitrate;
+	*bitrate = rate.bitrate;
 	return 0;
 }
 
@@ -1537,6 +1536,8 @@ static VAStatus encode_picture(struct v4l2r_context *ctx)
 	struct encode_input input;
 	VABufferID coded_id;
 	bool keyframe_requested;
+	bool force_keyframe;
+	uint32_t bitrate;
 	size_t capacity;
 	uint64_t tag;
 	int status;
@@ -1588,6 +1589,7 @@ static VAStatus encode_picture(struct v4l2r_context *ctx)
 		status = enc->hevc ? open_hevc(enc, surface) : open_h264(enc);
 		if (status < 0)
 			return status_from_errno(status);
+		bitrate = enc->bitrate;	/* set at open */
 	} else if (enc->hevc) {
 		const VAEncSequenceParameterBufferHEVC *sequence =
 			pic->have_sequence ? &pic->sequence.hevc : NULL;
@@ -1604,7 +1606,8 @@ static VAStatus encode_picture(struct v4l2r_context *ctx)
 			if (status < 0)
 				return status_from_errno(status);
 		}
-		status = update_rate(enc, sequence ? sequence->bits_per_second : 0);
+		status = check_rate(enc, sequence ? sequence->bits_per_second : 0,
+				    &bitrate);
 		if (status < 0)
 			return status_from_errno(status);
 	} else {
@@ -1626,7 +1629,8 @@ static VAStatus encode_picture(struct v4l2r_context *ctx)
 			if (status < 0)
 				return status_from_errno(status);
 		}
-		status = update_rate(enc, sequence ? sequence->bits_per_second : 0);
+		status = check_rate(enc, sequence ? sequence->bits_per_second : 0,
+				    &bitrate);
 		if (status < 0)
 			return status_from_errno(status);
 	}
@@ -1635,21 +1639,6 @@ static VAStatus encode_picture(struct v4l2r_context *ctx)
 	keyframe_requested = enc->hevc ? pic->intra :
 			     pic->picture.h264.pic_fields.bits.idr_pic_flag ||
 			     pic->intra;
-	if (enc->sequence > 0 && keyframe_requested) {
-		/*
-		 * FORCE_KEY_FRAME applies to the next frame apple-ave hands to
-		 * the firmware. Make sure that is this frame, not an earlier
-		 * one still waiting in the OUTPUT queue.
-		 */
-		status = ave_encoder_wait_output_idle(enc->encoder,
-						      AVE_KEYFRAME_IDLE_TIMEOUT_MS,
-						      store_packet, enc);
-		if (status == 0)
-			status = ave_encoder_force_keyframe(enc->encoder);
-		if (status < 0)
-			return status_from_errno(status);
-	}
-
 	if (!enc->frames_per_second)
 		return VA_STATUS_ERROR_OPERATION_FAILED;
 	if (surface->width < enc->encode_width ||
@@ -1664,6 +1653,39 @@ static VAStatus encode_picture(struct v4l2r_context *ctx)
 			   surface->id);
 		return status == -EINVAL ? VA_STATUS_ERROR_INVALID_SURFACE :
 					   status_from_errno(status);
+	}
+
+	/*
+	 * A new bit rate and FORCE_KEY_FRAME apply to the next frame apple-ave
+	 * hands to the firmware. Set them only once this picture can no longer
+	 * be refused, with the OUTPUT queue idle, so they reach this frame and
+	 * not an earlier one still waiting there.
+	 */
+	force_keyframe = enc->sequence > 0 && keyframe_requested;
+	if (force_keyframe || bitrate != enc->bitrate) {
+		bool changed = false;
+
+		status = ave_encoder_wait_output_idle(enc->encoder,
+						      AVE_KEYFRAME_IDLE_TIMEOUT_MS,
+						      store_packet, enc);
+		if (status == 0 && bitrate != enc->bitrate) {
+			status = ave_encoder_set_bitrate(enc->encoder, bitrate);
+			if (status == 0) {
+				enc->bitrate = bitrate;
+				changed = true;
+			}
+		}
+		if (status == 0 && force_keyframe)
+			status = ave_encoder_force_keyframe(enc->encoder);
+		if (status < 0) {
+			input_release(&input);
+			/* A bit rate already set for this refused picture would
+			 * apply to the next one: drop the session instead, as
+			 * after a failed submission. */
+			if (changed)
+				cancel_encoder(ctx);
+			return status_from_errno(status);
+		}
 	}
 
 	enc->sequence++;

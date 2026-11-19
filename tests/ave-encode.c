@@ -2328,6 +2328,24 @@ static void case_faults(void)
 	requested_vui_fps = 0;
 	omit_frame_rate_misc = false;
 	CHECK(vtable.vaSyncSurface(&driver, surfaces[0]) == VA_STATUS_SUCCESS);
+	/* A key frame request refused late (an input smaller than the session)
+	 * leaves no FORCE_KEY_FRAME armed for the next accepted frame. */
+	{
+		VASurfaceID small;
+		unsigned int forced = ave.force_keyframes;
+
+		CHECK(vtable.vaCreateSurfaces2(&driver, VA_RT_FORMAT_YUV420, 640, 360,
+					       &small, 1, NULL, 0) ==
+		      VA_STATUS_SUCCESS);
+		CHECK(submit_h264(context, small, coded, false, 2, 1, true) ==
+		      VA_STATUS_ERROR_INVALID_SURFACE);
+		CHECK(ave.force_keyframes == forced);
+		CHECK(submit_h264(context, surfaces[0], coded, false, 2, 1, true) ==
+		      VA_STATUS_SUCCESS);
+		CHECK(ave.force_keyframes == forced + 1);
+		CHECK(vtable.vaSyncSurface(&driver, surfaces[0]) == VA_STATUS_SUCCESS);
+		CHECK(vtable.vaDestroySurfaces(&driver, &small, 1) == VA_STATUS_SUCCESS);
+	}
 	CHECK(vtable.vaDestroyBuffer(&driver, coded) == VA_STATUS_SUCCESS);
 	CHECK(vtable.vaDestroyContext(&driver, context) == VA_STATUS_SUCCESS);
 
